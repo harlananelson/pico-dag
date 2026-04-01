@@ -1,0 +1,16 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Nix
+result
+.direnv/
+
+# Cache
+*.duckdb
+*.duckdb.wal
+
+# Exports
+code-lists/
+output/
