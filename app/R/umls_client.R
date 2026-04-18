@@ -102,16 +102,16 @@ umls_get_relations <- function(cui) {
 
   if (length(all_results) == 0) return(tibble::tibble())
 
-  purrr::map(all_results, \(rel) {
-    related_id <- rel$relatedId %||% ""
+  purrr::map(all_results, \(item) {
+    related_id <- item$relatedId %||% ""
     tibble::tibble(
       cui = cui,
       related_cui = if (nchar(related_id) > 0) {
         stringr::str_extract(related_id, "[^/]+$")
       } else "",
-      related_name = rel$relatedIdName %||% "",
-      rel = rel$relationLabel %||% "",
-      rela = rel$additionalRelationLabel %||% "",
+      related_name = item$relatedIdName %||% "",
+      rel = item$relationLabel %||% "",
+      rela = item$additionalRelationLabel %||% "",
     )
   }) |>
     purrr::list_rbind() |>
