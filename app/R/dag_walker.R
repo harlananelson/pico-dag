@@ -1,46 +1,55 @@
-#' DAG walker — categorize UMLS relations and perform second-hop traversal
+#' DAG walker — BFS traversal of UMLS concept graph
 
-# --- RELA → category mapping ---
+# ---------------------------------------------------------------------------
+# RELA → clinical category mapping
+# ---------------------------------------------------------------------------
 
 RELA_CATEGORIES <- c(
-  "may_be_treated_by" = "treatment",
-  "may_treat" = "treatment",
-  "has_finding_site" = "anatomy",
-  "finding_site_of" = "anatomy",
-  "component_of" = "monitoring_lab",
-  "has_component" = "monitoring_lab",
+  "may_be_treated_by"      = "treatment",
+  "may_treat"              = "treatment",
+  "has_finding_site"       = "anatomy",
+  "finding_site_of"        = "anatomy",
+  "component_of"           = "monitoring_lab",
+  "has_component"          = "monitoring_lab",
   "clinically_associated_with" = "comorbidity",
-  "focus_of" = "procedure",
-  "inverse_isa" = "subtype",
-  "isa" = "parent",
-  "manifestation_of" = "genetic",
-  "has_causative_agent" = "etiology",
-  "causative_agent_of" = "etiology",
-  "has_interpretation" = "interpretation",
-  "interprets" = "interpretation",
-  "associated_with" = "associated",
-  "associated_finding_of" = "associated",
-  # Direct disease → diagnostic test relations
-  "has_evaluation" = "diagnostic_lab",
-  "evaluated_by" = "diagnostic_lab",
+  "co-occurs_with"         = "comorbidity",
+  "focus_of"               = "procedure",
+  "inverse_isa"            = "subtype",
+  "isa"                    = "parent",
+  "manifestation_of"       = "genetic",
+  "has_causative_agent"    = "etiology",
+  "causative_agent_of"     = "etiology",
+  "has_interpretation"     = "interpretation",
+  "interprets"             = "interpretation",
+  "associated_with"        = "associated",
+  "associated_finding_of"  = "associated",
+  "has_evaluation"         = "diagnostic_lab",
+  "evaluated_by"           = "diagnostic_lab",
   "has_associated_finding" = "diagnostic_lab",
-  "finding_of" = "diagnostic_lab",
-  "diagnoses" = "diagnostic_lab",
-  "diagnosed_by" = "diagnostic_lab",
-  "has_finding" = "diagnostic_lab"
+  "finding_of"             = "diagnostic_lab",
+  "diagnoses"              = "diagnostic_lab",
+  "diagnosed_by"           = "diagnostic_lab",
+  "has_finding"            = "diagnostic_lab"
 )
 
 REL_CATEGORIES <- c(
   "CHD" = "narrower",
-  "RN" = "narrower",
+  "RN"  = "narrower",
   "PAR" = "broader",
-  "RB" = "broader"
+  "RB"  = "broader"
 )
 
-#' Categorize UMLS relations into clinical groups
-#'
-#' @param relations Tibble from umls_get_relations()
-#' @return Tibble with added category column
+# Categories whose nodes are expanded further in BFS.
+# Labs, anatomy, procedures are leaves — collecting them is useful but
+# walking their children produces noise.
+BFS_EXPAND_CATEGORIES <- c(
+  "treatment", "comorbidity", "etiology", "parent", "subtype", "associated"
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 categorize_relations <- function(relations) {
   relations |>
     dplyr::mutate(
@@ -53,158 +62,182 @@ categorize_relations <- function(relations) {
     )
 }
 
-# Relations to follow for neighbor expansion (hop-2 lab discovery)
-EXPAND_RELAS <- c("has_causative_agent", "causative_agent_of",
-                  "isa", "inverse_isa",
-                  "clinically_associated_with",
-                  "manifestation_of", "has_pathological_process")
+# ---------------------------------------------------------------------------
+# BFS core
+# ---------------------------------------------------------------------------
 
-#' Walk the full concept DAG from a root CUI
+#' BFS walk over the UMLS concept graph from a root CUI.
 #'
-#' @param cui Character. Root concept CUI
-#' @param discover_monitoring_labs Logical. Follow treatments to their monitoring labs?
-#' @param expand_for_labs Logical. Also walk neighbors (causative agent, parents,
-#'   subtypes) to collect lab relations not attached to the root itself.
-#' @param progress Function. Called with status messages for UI updates
-#' @return List with concept, relations, treatments, monitoring_labs,
-#'   diagnostic_labs, comorbidities, procedures, anatomy
-walk_concept_dag <- function(cui, discover_monitoring_labs = TRUE,
-                             expand_for_labs = TRUE, progress = NULL) {
+#' At each visited node, fetches all relations and categorizes them.
+#' Nodes whose category is in BFS_EXPAND_CATEGORIES are queued for
+#' further traversal (up to max_depth hops from root).
+#'
+#' @param root_cui     Root concept CUI.
+#' @param max_depth    Maximum hops from root (default 2).
+#' @param expand_n     Max nodes to expand per depth level (controls API calls).
+#' @param progress     Optional progress callback function(message).
+#' @return Tibble of all collected relations with depth and via columns.
+bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
+  visited  <- character()
+  # queue entries: list(cui, depth, via)
+  queue    <- list(list(cui = root_cui, depth = 0L, via = NA_character_))
+  all_rels <- list()
+  # Track how many nodes we have expanded at each depth > 0
+  expanded_at_depth <- integer(max_depth + 1L)
+
+  while (length(queue) > 0) {
+    node  <- queue[[1]]
+    queue <- queue[-1]
+
+    if (node$cui %in% visited)        next
+    if (node$depth > max_depth)        next
+    # Cap expansions at depth > 0
+    if (node$depth > 0L) {
+      if (expanded_at_depth[node$depth] >= expand_n) next
+      expanded_at_depth[node$depth] <- expanded_at_depth[node$depth] + 1L
+    }
+
+    visited <- c(visited, node$cui)
+
+    if (!is.null(progress)) {
+      msg <- if (is.na(node$via)) {
+        "Fetching root concept relations..."
+      } else {
+        paste0("[depth ", node$depth, "] ", node$via)
+      }
+      progress(msg)
+    }
+
+    rels <- tryCatch({
+      umls_get_relations(node$cui) |>
+        categorize_relations() |>
+        dplyr::mutate(
+          depth = node$depth,
+          via   = node$via
+        )
+    }, error = \(e) NULL)
+
+    if (is.null(rels) || nrow(rels) == 0) {
+      Sys.sleep(0.15)
+      next
+    }
+
+    all_rels[[length(all_rels) + 1]] <- rels
+
+    # Queue children from expandable categories
+    if (node$depth < max_depth) {
+      children <- rels |>
+        dplyr::filter(
+          category %in% BFS_EXPAND_CATEGORIES,
+          !related_cui %in% visited
+        ) |>
+        # Prioritise: named rela over blank, shorter names first as a tiebreak
+        dplyr::arrange(nchar(rela) == 0, nchar(related_name))
+
+      for (i in seq_len(nrow(children))) {
+        child_cui  <- children$related_cui[i]
+        child_name <- children$related_name[i]
+        if (!child_cui %in% visited) {
+          via_label <- if (is.na(node$via)) child_name
+                       else paste0(node$via, " → ", child_name)
+          queue[[length(queue) + 1]] <- list(
+            cui   = child_cui,
+            depth = node$depth + 1L,
+            via   = via_label
+          )
+        }
+      }
+    }
+
+    Sys.sleep(0.15)
+  }
+
+  if (length(all_rels) == 0) return(tibble::tibble())
+
+  purrr::list_rbind(all_rels) |>
+    # Keep first occurrence of each (related_cui, category) pair —
+    # shallowest path wins (queue is FIFO so depth order is preserved)
+    dplyr::distinct(related_cui, category, .keep_all = TRUE)
+}
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+#' Walk the UMLS concept DAG from a root CUI.
+#'
+#' Performs BFS up to max_depth hops, collecting clinical relations at every
+#' level. Nodes in BFS_EXPAND_CATEGORIES are queued for further traversal;
+#' leaf categories (labs, anatomy, procedures) are collected but not expanded.
+#'
+#' @param cui          Root CUI.
+#' @param max_depth    Hops from root (1 = direct relations only; 2 = default).
+#' @param expand_n     Max nodes expanded per depth level (caps API calls).
+#' @param progress     Optional progress callback.
+#' @return Named list: concept, relations, treatments, comorbidities,
+#'   procedures, anatomy, subtypes, parents, diagnostic_labs,
+#'   monitoring_labs, etiology, genetic, interpretation.
+walk_concept_dag <- function(cui, max_depth = 2L, expand_n = 8L,
+                             progress = NULL) {
   if (!is.null(progress)) progress("Fetching concept details...")
   concept <- umls_get_concept(cui)
 
-  if (!is.null(progress)) progress("Fetching relationships...")
-  relations <- umls_get_relations(cui) |>
-    categorize_relations()
+  all_rels <- bfs_walk(cui,
+                       max_depth = max_depth,
+                       expand_n  = expand_n,
+                       progress  = progress)
 
-  result <- list(
-    concept = concept,
-    relations = relations,
-    treatments = relations |> dplyr::filter(category == "treatment"),
-    comorbidities = relations |> dplyr::filter(category == "comorbidity"),
-    procedures = relations |> dplyr::filter(category == "procedure"),
-    anatomy = relations |> dplyr::filter(category == "anatomy"),
-    subtypes = relations |> dplyr::filter(category == "subtype"),
-    parents = relations |> dplyr::filter(category == "parent"),
-    interpretation = relations |> dplyr::filter(category == "interpretation"),
-    genetic = relations |> dplyr::filter(category == "genetic"),
-    diagnostic_labs = relations |>
-      dplyr::filter(category %in% c("diagnostic_lab", "monitoring_lab")),
-    monitoring_labs = tibble::tibble()
+  extract <- function(cats) {
+    if (nrow(all_rels) == 0) return(tibble::tibble())
+    all_rels |> dplyr::filter(category %in% cats)
+  }
+
+  list(
+    concept        = concept,
+    relations      = all_rels,
+    treatments     = extract("treatment"),
+    comorbidities  = extract("comorbidity"),
+    procedures     = extract("procedure"),
+    anatomy        = extract("anatomy"),
+    subtypes       = extract("subtype"),
+    parents        = extract("parent"),
+    etiology       = extract("etiology"),
+    genetic        = extract("genetic"),
+    interpretation = extract("interpretation"),
+    diagnostic_labs = extract(c("diagnostic_lab", "monitoring_lab")),
+    monitoring_labs = tibble::tibble()   # kept for UI compatibility
   )
-
-  # Neighbor expansion: walk related concepts to collect lab relations
-  # they may carry but the root concept doesn't
-  if (expand_for_labs) {
-    if (!is.null(progress)) progress("Expanding neighbors for lab discovery...")
-
-    neighbors <- relations |>
-      dplyr::filter(rela %in% EXPAND_RELAS) |>
-      dplyr::slice_head(n = 15)  # cap API calls
-
-    extra_labs <- list()
-    for (i in seq_len(nrow(neighbors))) {
-      ncui <- neighbors$related_cui[i]
-      nname <- neighbors$related_name[i]
-      if (!is.null(progress)) {
-        progress(paste0("Checking neighbor: ", nname))
-      }
-      tryCatch({
-        nrels <- umls_get_relations(ncui) |> categorize_relations()
-        labs <- nrels |>
-          dplyr::filter(category %in% c("diagnostic_lab", "monitoring_lab")) |>
-          dplyr::mutate(via_neighbor = nname)
-        if (nrow(labs) > 0) extra_labs[[length(extra_labs) + 1]] <- labs
-        Sys.sleep(0.2)
-      }, error = \(e) NULL)
-    }
-
-    if (length(extra_labs) > 0) {
-      all_labs <- dplyr::bind_rows(
-        result$diagnostic_labs |> dplyr::mutate(via_neighbor = NA_character_),
-        purrr::list_rbind(extra_labs)
-      ) |>
-        dplyr::distinct(related_cui, .keep_all = TRUE)
-      result$diagnostic_labs <- all_labs
-    }
-  }
-
-  # Treatment second-hop: find monitoring labs via treatment → component_of
-  if (discover_monitoring_labs && nrow(result$treatments) > 0) {
-    if (!is.null(progress)) progress("Discovering monitoring labs for treatments...")
-
-    lab_list <- list()
-    treatments_to_check <- result$treatments
-
-    for (i in seq_len(min(nrow(treatments_to_check), 20))) {
-      drug_cui <- treatments_to_check$related_cui[i]
-      drug_name <- treatments_to_check$related_name[i]
-
-      if (!is.null(progress)) {
-        progress(paste0("Labs for ", drug_name, " (", i, "/",
-                        min(nrow(treatments_to_check), 20), ")"))
-      }
-
-      tryCatch({
-        drug_rels <- umls_get_relations(drug_cui) |>
-          categorize_relations()
-
-        labs <- drug_rels |>
-          dplyr::filter(category == "monitoring_lab") |>
-          dplyr::mutate(
-            parent_drug_cui = drug_cui,
-            parent_drug_name = drug_name
-          )
-
-        if (nrow(labs) > 0) {
-          lab_list[[length(lab_list) + 1]] <- labs
-        }
-
-        Sys.sleep(0.25)
-      }, error = \(e) NULL)
-    }
-
-    if (length(lab_list) > 0) {
-      result$monitoring_labs <- purrr::list_rbind(lab_list)
-    }
-  }
-
-  result
 }
 
-#' Walk a PICO element (intervention, comparator, or outcome)
+#' Walk a single PICO element (intervention, comparator, or outcome).
 #'
-#' @param cui Character. CUI for this PICO element
-#' @param element Character. "intervention", "comparator", or "outcome"
-#' @param progress Function. Status callback
-#' @return List with concept, relations, and element-specific data
+#' Uses depth-1 only — PICO elements are already specific enough that
+#' deep BFS would wander.
+#'
+#' @param cui     CUI for this PICO element.
+#' @param element "intervention", "comparator", or "outcome".
+#' @param progress Status callback.
 walk_pico_element <- function(cui, element, progress = NULL) {
   if (!is.null(progress)) progress(paste0("Walking ", element, "..."))
 
-  concept <- umls_get_concept(cui)
-  relations <- umls_get_relations(cui) |>
-    categorize_relations()
+  concept   <- umls_get_concept(cui)
+  relations <- umls_get_relations(cui) |> categorize_relations() |>
+    dplyr::mutate(depth = 0L, via = NA_character_)
 
-  result <- list(
-    concept = concept,
-    relations = relations,
-    element = element
-  )
+  result <- list(concept = concept, relations = relations, element = element)
 
-  # For interventions/comparators: get monitoring labs
   if (element %in% c("intervention", "comparator")) {
-    labs <- relations |> dplyr::filter(category == "monitoring_lab")
-    result$monitoring_labs <- labs
-
-    # Also find what else this drug treats
-    result$also_treats <- relations |> dplyr::filter(category == "treatment")
+    result$monitoring_labs <- relations |>
+      dplyr::filter(category == "monitoring_lab")
+    result$also_treats <- relations |>
+      dplyr::filter(category == "treatment")
   }
 
-  # For outcomes: get related conditions to adjust for
   if (element == "outcome") {
     result$related_conditions <- relations |>
       dplyr::filter(category %in% c("comorbidity", "associated"))
-    result$subtypes <- relations |> dplyr::filter(category == "subtype")
+    result$subtypes <- relations |>
+      dplyr::filter(category == "subtype")
   }
 
   result
