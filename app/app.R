@@ -113,6 +113,10 @@ ui <- page_navbar(
 
   nav_panel("Labs",
     card(
+      card_header("Diagnostic Labs (from disease → evaluated_by / has_associated_finding)"),
+      DTOutput("diagnostic_labs_table")
+    ),
+    card(
       card_header("Monitoring Labs (from treatment → component_of)"),
       DTOutput("monitoring_labs_table")
     )
@@ -277,7 +281,21 @@ server <- function(input, output, session) {
 
   output$n_labs <- renderText({
     if (is.null(rv$dag_result)) return("—")
-    nrow(rv$dag_result$monitoring_labs)
+    nrow(rv$dag_result$monitoring_labs) + nrow(rv$dag_result$diagnostic_labs)
+  })
+
+  output$diagnostic_labs_table <- renderDT({
+    req(rv$dag_result)
+    if (is.null(rv$dag_result$diagnostic_labs) || nrow(rv$dag_result$diagnostic_labs) == 0) {
+      return(datatable(tibble::tibble(Message = "No diagnostic labs found via evaluated_by / has_associated_finding")))
+    }
+    rv$dag_result$diagnostic_labs |>
+      dplyr::select(
+        Lab = related_name,
+        CUI = related_cui,
+        Relationship = rela
+      ) |>
+      datatable(filter = "top", options = list(pageLength = 25), rownames = FALSE)
   })
 
   output$n_procedures <- renderText({
@@ -511,7 +529,8 @@ server <- function(input, output, session) {
         "This specification covers ",
         nrow(rv$dag_result$treatments), " treatments, ",
         nrow(rv$dag_result$comorbidities), " comorbidities, ",
-        nrow(rv$dag_result$procedures), " procedures, and ",
+        nrow(rv$dag_result$procedures), " procedures, ",
+        nrow(rv$dag_result$diagnostic_labs), " diagnostic labs, and ",
         nrow(rv$dag_result$monitoring_labs), " monitoring labs ",
         "discovered via UMLS concept graph traversal."
       )),

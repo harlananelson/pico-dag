@@ -141,6 +141,18 @@ package_code_lists <- function(dag_result, pico_elements = list()) {
     if (nrow(tx_codes) > 0) code_lists$treatment_rxnorm <- tx_codes
   }
 
+  # Diagnostic LOINC — direct from disease via evaluated_by / has_associated_finding etc.
+  if (!is.null(dag_result$diagnostic_labs) && nrow(dag_result$diagnostic_labs) > 0) {
+    diag_loinc <- generate_loinc_codes(dag_result$diagnostic_labs)
+    if (nrow(diag_loinc) > 0) code_lists$diagnostic_loinc <- diag_loinc
+  }
+
+  # Monitoring LOINC — from treatment second-hop
+  if (nrow(dag_result$monitoring_labs) > 0) {
+    mon_loinc <- generate_loinc_codes(dag_result$monitoring_labs)
+    if (nrow(mon_loinc) > 0) code_lists$monitoring_loinc <- mon_loinc
+  }
+
   # PICO elements
   for (elem in pico_elements) {
     prefix <- elem$element

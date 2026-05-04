@@ -19,7 +19,14 @@ RELA_CATEGORIES <- c(
   "has_interpretation" = "interpretation",
   "interprets" = "interpretation",
   "associated_with" = "associated",
-  "associated_finding_of" = "associated"
+  "associated_finding_of" = "associated",
+  # Direct disease → diagnostic test relations
+  "evaluated_by" = "diagnostic_lab",
+  "has_associated_finding" = "diagnostic_lab",
+  "finding_of" = "diagnostic_lab",
+  "diagnoses" = "diagnostic_lab",
+  "diagnosed_by" = "diagnostic_lab",
+  "has_finding" = "diagnostic_lab"
 )
 
 REL_CATEGORIES <- c(
@@ -74,6 +81,7 @@ walk_concept_dag <- function(cui, discover_monitoring_labs = TRUE, progress = NU
     parents = relations |> dplyr::filter(category == "parent"),
     interpretation = relations |> dplyr::filter(category == "interpretation"),
     genetic = relations |> dplyr::filter(category == "genetic"),
+    diagnostic_labs = relations |> dplyr::filter(category == "diagnostic_lab"),
     monitoring_labs = tibble::tibble()
   )
 
