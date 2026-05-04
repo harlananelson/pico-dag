@@ -207,7 +207,6 @@ server <- function(input, output, session) {
     withProgress(message = "Walking UMLS concept graph...", {
       rv$dag_result <- walk_concept_dag(
         rv$pop_cui,
-        discover_monitoring_labs = TRUE,
         progress = \(msg) setProgress(message = msg)
       )
       rv$pop_concept <- rv$dag_result$concept
