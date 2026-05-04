@@ -287,15 +287,18 @@ server <- function(input, output, session) {
   output$diagnostic_labs_table <- renderDT({
     req(rv$dag_result)
     if (is.null(rv$dag_result$diagnostic_labs) || nrow(rv$dag_result$diagnostic_labs) == 0) {
-      return(datatable(tibble::tibble(Message = "No diagnostic labs found via evaluated_by / has_associated_finding")))
+      return(datatable(tibble::tibble(
+        Message = "No diagnostic labs found — tried root concept, causative agent, parents, and subtypes"
+      )))
     }
-    rv$dag_result$diagnostic_labs |>
+    df <- rv$dag_result$diagnostic_labs |>
       dplyr::select(
-        Lab = related_name,
-        CUI = related_cui,
-        Relationship = rela
-      ) |>
-      datatable(filter = "top", options = list(pageLength = 25), rownames = FALSE)
+        Lab        = related_name,
+        CUI        = related_cui,
+        Relationship = rela,
+        `Via`      = dplyr::any_of("via_neighbor")
+      )
+    datatable(df, filter = "top", options = list(pageLength = 25), rownames = FALSE)
   })
 
   output$n_procedures <- renderText({

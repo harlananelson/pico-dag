@@ -21,6 +21,7 @@ RELA_CATEGORIES <- c(
   "associated_with" = "associated",
   "associated_finding_of" = "associated",
   # Direct disease → diagnostic test relations
+  "has_evaluation" = "diagnostic_lab",
   "evaluated_by" = "diagnostic_lab",
   "has_associated_finding" = "diagnostic_lab",
   "finding_of" = "diagnostic_lab",
@@ -52,17 +53,23 @@ categorize_relations <- function(relations) {
     )
 }
 
+# Relations to follow for neighbor expansion (hop-2 lab discovery)
+EXPAND_RELAS <- c("has_causative_agent", "causative_agent_of",
+                  "isa", "inverse_isa",
+                  "clinically_associated_with",
+                  "manifestation_of", "has_pathological_process")
+
 #' Walk the full concept DAG from a root CUI
 #'
-#' Fetches relations, categorizes them, and optionally performs
-#' second-hop traversal for treatments (to find monitoring labs).
-#'
 #' @param cui Character. Root concept CUI
-#' @param discover_monitoring_labs Logical. Follow treatments to their labs?
+#' @param discover_monitoring_labs Logical. Follow treatments to their monitoring labs?
+#' @param expand_for_labs Logical. Also walk neighbors (causative agent, parents,
+#'   subtypes) to collect lab relations not attached to the root itself.
 #' @param progress Function. Called with status messages for UI updates
-#' @return List with components: concept, relations, treatments,
-#'         monitoring_labs, comorbidities, procedures, anatomy
-walk_concept_dag <- function(cui, discover_monitoring_labs = TRUE, progress = NULL) {
+#' @return List with concept, relations, treatments, monitoring_labs,
+#'   diagnostic_labs, comorbidities, procedures, anatomy
+walk_concept_dag <- function(cui, discover_monitoring_labs = TRUE,
+                             expand_for_labs = TRUE, progress = NULL) {
   if (!is.null(progress)) progress("Fetching concept details...")
   concept <- umls_get_concept(cui)
 
@@ -81,11 +88,48 @@ walk_concept_dag <- function(cui, discover_monitoring_labs = TRUE, progress = NU
     parents = relations |> dplyr::filter(category == "parent"),
     interpretation = relations |> dplyr::filter(category == "interpretation"),
     genetic = relations |> dplyr::filter(category == "genetic"),
-    diagnostic_labs = relations |> dplyr::filter(category == "diagnostic_lab"),
+    diagnostic_labs = relations |>
+      dplyr::filter(category %in% c("diagnostic_lab", "monitoring_lab")),
     monitoring_labs = tibble::tibble()
   )
 
-  # Second-hop: for each treatment, find monitoring labs
+  # Neighbor expansion: walk related concepts to collect lab relations
+  # they may carry but the root concept doesn't
+  if (expand_for_labs) {
+    if (!is.null(progress)) progress("Expanding neighbors for lab discovery...")
+
+    neighbors <- relations |>
+      dplyr::filter(rela %in% EXPAND_RELAS) |>
+      dplyr::slice_head(n = 15)  # cap API calls
+
+    extra_labs <- list()
+    for (i in seq_len(nrow(neighbors))) {
+      ncui <- neighbors$related_cui[i]
+      nname <- neighbors$related_name[i]
+      if (!is.null(progress)) {
+        progress(paste0("Checking neighbor: ", nname))
+      }
+      tryCatch({
+        nrels <- umls_get_relations(ncui) |> categorize_relations()
+        labs <- nrels |>
+          dplyr::filter(category %in% c("diagnostic_lab", "monitoring_lab")) |>
+          dplyr::mutate(via_neighbor = nname)
+        if (nrow(labs) > 0) extra_labs[[length(extra_labs) + 1]] <- labs
+        Sys.sleep(0.2)
+      }, error = \(e) NULL)
+    }
+
+    if (length(extra_labs) > 0) {
+      all_labs <- dplyr::bind_rows(
+        result$diagnostic_labs |> dplyr::mutate(via_neighbor = NA_character_),
+        purrr::list_rbind(extra_labs)
+      ) |>
+        dplyr::distinct(related_cui, .keep_all = TRUE)
+      result$diagnostic_labs <- all_labs
+    }
+  }
+
+  # Treatment second-hop: find monitoring labs via treatment → component_of
   if (discover_monitoring_labs && nrow(result$treatments) > 0) {
     if (!is.null(progress)) progress("Discovering monitoring labs for treatments...")
 
@@ -116,11 +160,8 @@ walk_concept_dag <- function(cui, discover_monitoring_labs = TRUE, progress = NU
           lab_list[[length(lab_list) + 1]] <- labs
         }
 
-        Sys.sleep(0.25) # rate limit
-      }, error = \(e) {
-        # Skip on API errors
-        NULL
-      })
+        Sys.sleep(0.25)
+      }, error = \(e) NULL)
     }
 
     if (length(lab_list) > 0) {
