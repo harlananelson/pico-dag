@@ -66,19 +66,52 @@ generate_rxnorm_codes <- function(treatments) {
     purrr::list_rbind()
 }
 
-#' Generate LOINC codes for lab concepts
+#' Fetch the LOINC class number (LCN) for a single LOINC code via UMLS.
+#' Returns integer: 1=Lab, 2=Clinical, 3=Claims, 4=Survey. NA on failure.
+.loinc_class_number <- function(loinc_code) {
+  tryCatch({
+    resp <- httr2::request("https://uts-ws.nlm.nih.gov/rest") |>
+      httr2::req_url_path_append("content", "current", "source", "LNC",
+                                  loinc_code, "attributes") |>
+      httr2::req_url_query(apiKey = get_api_key(), pageSize = 50) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+    attrs <- resp$result %||% list()
+    val <- purrr::keep(attrs, \(a) (a$name %||% "") == "LCN")
+    if (length(val) == 0) return(NA_integer_)
+    as.integer(val[[1]]$value)
+  }, error = \(e) NA_integer_)
+}
+
+#' Generate LOINC codes for lab concepts, filtered to laboratory class only.
+#'
+#' Uses the UMLS LCN attribute (LOINC Class Number) to exclude surveys (4),
+#' clinical notes (2), and claims attachments (3). Only LCN=1 (Laboratory)
+#' codes are returned.
 #'
 #' @param labs Tibble of lab concepts (from DAG walker)
-#' @return Tibble with code, name, vocabulary, source_cui
-generate_loinc_codes <- function(labs) {
+#' @param lab_only Logical. If TRUE (default), filter to LCN=1 only.
+#' @return Tibble with code, name, vocabulary, source_cui, loinc_class
+generate_loinc_codes <- function(labs, lab_only = TRUE) {
   if (nrow(labs) == 0) return(tibble::tibble())
 
-  purrr::map(seq_len(nrow(labs)), \(i) {
+  rows <- purrr::map(seq_len(nrow(labs)), \(i) {
     tryCatch({
-      umls_get_source_codes(labs$related_cui[i], "LNC")
+      codes <- umls_get_source_codes(labs$related_cui[i], "LNC")
+      if (nrow(codes) == 0) return(tibble::tibble())
+      # Fetch LCN for each LOINC code (with rate limiting)
+      codes$loinc_class <- purrr::map_int(codes$code, \(lc) {
+        Sys.sleep(0.1)
+        .loinc_class_number(lc)
+      })
+      codes
     }, error = \(e) tibble::tibble())
   }) |>
     purrr::list_rbind()
+
+  if (nrow(rows) == 0) return(tibble::tibble())
+  if (lab_only) rows <- rows |> dplyr::filter(loinc_class == 1L | is.na(loinc_class))
+  rows
 }
 
 #' Generate CPT codes for procedure concepts
