@@ -105,13 +105,14 @@ umls_get_relations <- function(cui) {
   purrr::map(all_results, \(item) {
     related_id <- item$relatedId %||% ""
     tibble::tibble(
-      cui = cui,
-      related_cui = if (nchar(related_id) > 0) {
+      cui          = cui,
+      related_cui  = if (nchar(related_id) > 0) {
         stringr::str_extract(related_id, "[^/]+$")
       } else "",
       related_name = item$relatedIdName %||% "",
-      rel = item$relationLabel %||% "",
-      rela = item$additionalRelationLabel %||% "",
+      rel          = item$relationLabel %||% "",
+      rela         = item$additionalRelationLabel %||% "",
+      related_id_url = related_id   # preserved for source-concept resolution
     )
   }) |>
     purrr::list_rbind() |>
