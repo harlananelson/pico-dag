@@ -13,6 +13,7 @@ RELA_CATEGORIES <- c(
   "has_component"          = "monitoring_lab",
   "clinically_associated_with" = "comorbidity",
   "co-occurs_with"         = "comorbidity",
+  "cause_of"               = "comorbidity",
   "focus_of"               = "procedure",
   "inverse_isa"            = "subtype",
   "isa"                    = "parent",
