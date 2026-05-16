@@ -847,13 +847,27 @@ server <- function(input, output, session) {
         lines <- c(lines, "", "# Monitoring Labs", "",
                     "| Lab | Monitors | CUI |",
                     "|-----|----------|-----|")
+        # Derive the monitored drug from from_cui via the broader relations
+        # table (the lab row stores from_cui = the drug that surfaced it).
+        # The previous code referenced a `parent_drug_name` column that
+        # never existed and crashed the download.
+        drug_lookup <- if (!is.null(rv$dag_result$relations) &&
+                            nrow(rv$dag_result$relations) > 0) {
+          rv$dag_result$relations |>
+            dplyr::distinct(related_cui, related_name) |>
+            dplyr::rename(from_cui = related_cui, drug_name = related_name)
+        } else {
+          tibble::tibble(from_cui = character(0), drug_name = character(0))
+        }
         unique_labs <- monitoring |>
+          dplyr::left_join(drug_lookup, by = "from_cui") |>
           dplyr::distinct(related_cui, .keep_all = TRUE) |>
           utils::head(30)
+        unique_labs$drug_name[is.na(unique_labs$drug_name)] <- "—"
         for (i in seq_len(nrow(unique_labs))) {
           lines <- c(lines, paste0(
             "| ", unique_labs$related_name[i],
-            " | ", unique_labs$parent_drug_name[i],
+            " | ", unique_labs$drug_name[i],
             " | ", unique_labs$related_cui[i], " |"
           ))
         }

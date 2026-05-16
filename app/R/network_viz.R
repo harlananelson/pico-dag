@@ -2,25 +2,39 @@
 
 # Domain → color mapping
 DOMAIN_COLORS <- c(
-  "population" = "#E74C3C",    # red
-  "treatment" = "#3498DB",     # blue
+  "population"     = "#E74C3C", # red
+  "treatment"      = "#3498DB", # blue
   "monitoring_lab" = "#2ECC71", # green
-  "comorbidity" = "#E67E22",   # orange
-  "procedure" = "#9B59B6",     # purple
-  "anatomy" = "#F39C12",       # yellow
-  "subtype" = "#95A5A6",       # gray
-  "parent" = "#BDC3C7",        # light gray
-  "outcome" = "#E74C3C",       # red (same as population)
-  "intervention" = "#1ABC9C",  # teal
-  "comparator" = "#16A085",    # dark teal
-  "etiology"   = "#C0392B",    # deep red
-  "other" = "#7F8C8D"          # dark gray
+  "diagnostic_lab" = "#27AE60", # darker green — distinct from monitoring
+  "comorbidity"    = "#E67E22", # orange
+  "procedure"      = "#9B59B6", # purple
+  "anatomy"        = "#F39C12", # yellow
+  "subtype"        = "#95A5A6", # gray
+  "parent"         = "#BDC3C7", # light gray
+  "outcome"        = "#E74C3C", # red (same as population)
+  "intervention"   = "#1ABC9C", # teal
+  "comparator"     = "#16A085", # dark teal
+  "etiology"       = "#C0392B", # deep red
+  "other"          = "#7F8C8D"  # dark gray
 )
 
 # Strip generic UMLS scaffolding phrases before truncating node labels.
 # Vectorized: gsub/sub/str_trunc all operate elementwise on character vectors.
-clean_node_label <- function(x, max_chars = 32) {
+# Also recovers any label that slipped through as a bare CUI (e.g. when the
+# upstream concept_preferred / mrconso fallback both miss) by substituting
+# a marker the user can recognize.
+clean_node_label <- function(x, max_chars = 32, cuis = NULL) {
   x <- ifelse(is.na(x), "", as.character(x))
+  # Recover: if a label looks like a bare CUI, replace with "(unnamed)".
+  # Resolution should happen upstream via umls_preferred_name(); this is the
+  # last-mile safety net.
+  if (!is.null(cuis)) {
+    leaked <- grepl("^C\\d+$", x) | !nzchar(x)
+    if (any(leaked)) x[leaked] <- paste0("(unnamed ", cuis[leaked], ")")
+  } else {
+    leaked <- grepl("^C\\d+$", x)
+    if (any(leaked)) x[leaked] <- "(unnamed)"
+  }
   y <- gsub("\\s+", " ", x)
   y <- sub("^Disorder characterized by\\s+", "", y, ignore.case = TRUE)
   y <- sub("^Disease or Syndrome\\s*:?\\s*", "", y, ignore.case = TRUE)
@@ -69,24 +83,41 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     } else {
       data$from_cui[is.na(data$from_cui) | !nzchar(data$from_cui)] <- root_id
     }
+    # Last-mile name resolution: if a row arrived here with an empty or
+    # bare-CUI name, resolve from UMLS before rendering. Eliminates the
+    # remaining bare-CUI display bug for any path the SQL fallback missed.
+    name_broken <- is.na(data$related_name) |
+                   !nzchar(data$related_name) |
+                   data$related_name == data$related_cui
+    if (any(name_broken) && exists("umls_preferred_name", mode = "function")) {
+      data$related_name[name_broken] <-
+        unname(umls_preferred_name(data$related_cui[name_broken]))
+    }
     data <- data |>
       dplyr::group_by(from_cui) |>
       dplyr::slice_head(n = max_nodes) |>
       dplyr::ungroup()
     edge_from <- data$from_cui
+    rela_disp <- if (exists("display_rela", mode = "function")) {
+      display_rela(data$rela)
+    } else {
+      data$rela
+    }
     nodes <- tibble::tibble(
       id    = data$related_cui,
-      label = clean_node_label(data$related_name),
+      label = clean_node_label(data$related_name, cuis = data$related_cui),
       group = category,
       title = paste0("<b>", data$related_name, "</b><br>CUI: ", data$related_cui,
-                     "<br>Relationship: ", data$rela),
+                     "<br>Relationship: ", rela_disp,
+                     " <span style='color:#888'>(", data$rela, ")</span>"),
       shape = "dot",
       size  = 15
     )
     edges <- tibble::tibble(
       from   = edge_from,
       to     = data$related_cui,
-      label  = data$rela,
+      label  = rela_disp,
+      title  = data$rela,                    # raw rela in hover tooltip
       arrows = "to",
       color  = DOMAIN_COLORS[category] %||% "#7F8C8D"
     )
@@ -100,7 +131,8 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     make_category_rows(dag_result$anatomy,         "anatomy",        max_nodes = 10),
     make_category_rows(dag_result$subtypes,        "subtype",        max_nodes = 15),
     make_category_rows(dag_result$parents,         "parent",         max_nodes =  6),
-    make_category_rows(dag_result$diagnostic_labs, "monitoring_lab", max_nodes = 15),
+    make_category_rows(dag_result$diagnostic_labs, "diagnostic_lab", max_nodes = 15),
+    make_category_rows(dag_result$monitoring_labs, "monitoring_lab", max_nodes = 15),
     if (!is.null(dag_result$etiology)) make_category_rows(dag_result$etiology, "etiology", max_nodes = 8)
     else list(nodes = NULL, edges = NULL)
   )
@@ -155,19 +187,16 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     edges <- edges[edges$from %in% keep_ids & edges$to %in% keep_ids, , drop = FALSE]
   }
 
-  # Build visNetwork
-  visNetwork::visNetwork(nodes, edges, width = "100%", height = "600px") |>
-    visNetwork::visGroups(groupname = "population", color = DOMAIN_COLORS["population"]) |>
-    visNetwork::visGroups(groupname = "treatment", color = DOMAIN_COLORS["treatment"]) |>
-    visNetwork::visGroups(groupname = "monitoring_lab", color = DOMAIN_COLORS["monitoring_lab"]) |>
-    visNetwork::visGroups(groupname = "comorbidity", color = DOMAIN_COLORS["comorbidity"]) |>
-    visNetwork::visGroups(groupname = "procedure", color = DOMAIN_COLORS["procedure"]) |>
-    visNetwork::visGroups(groupname = "anatomy", color = DOMAIN_COLORS["anatomy"]) |>
-    visNetwork::visGroups(groupname = "subtype", color = DOMAIN_COLORS["subtype"]) |>
-    visNetwork::visGroups(groupname = "parent", color = DOMAIN_COLORS["parent"]) |>
-    visNetwork::visGroups(groupname = "etiology", color = DOMAIN_COLORS["etiology"]) |>
-    visNetwork::visGroups(groupname = "intervention", color = DOMAIN_COLORS["intervention"]) |>
-    visNetwork::visGroups(groupname = "comparator", color = DOMAIN_COLORS["comparator"]) |>
+  # Build visNetwork. Drive group styling from DOMAIN_COLORS so adding a new
+  # category in one place doesn't require chasing visGroups call-by-call.
+  net <- visNetwork::visNetwork(nodes, edges, width = "100%", height = "600px")
+  net <- purrr::reduce(
+    names(DOMAIN_COLORS),
+    \(g, gn) visNetwork::visGroups(g, groupname = gn,
+                                   color = unname(DOMAIN_COLORS[gn])),
+    .init = net
+  )
+  net |>
     visNetwork::visLegend(useGroups = TRUE, position = "right") |>
     visNetwork::visOptions(
       highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE),

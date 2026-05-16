@@ -87,6 +87,140 @@ REL_CATEGORIES <- c(
   "RB"  = "broader"
 )
 
+# ---------------------------------------------------------------------------
+# Human-readable RELA labels for the visNetwork edges + CSV exports
+# ---------------------------------------------------------------------------
+
+#' Map raw UMLS rela strings to user-friendly display labels.
+#' Single source of truth — used by network_viz.R for edges and by dag_export.R
+#' to add a rela_display column alongside the raw rela in CSV/GraphML exports.
+RELA_DISPLAY <- c(
+  "isa"                          = "is a kind of",
+  "inverse_isa"                  = "has subtype",
+  "may_be_treated_by"            = "may be treated by",
+  "may_treat"                    = "may treat",
+  "may_be_prevented_by"          = "may be prevented by",
+  "may_prevent"                  = "may prevent",
+  "has_causative_agent"          = "caused by",
+  "causative_agent_of"           = "causes",
+  "induced_by"                   = "induced by",
+  "clinically_associated_with"   = "associated with",
+  "co-occurs_with"               = "co-occurs with",
+  "associated_condition_of"      = "occurs with",
+  "cause_of"                     = "causes",
+  "has_finding_site"             = "occurs in",
+  "finding_site_of"              = "site of",
+  "evaluated_by"                 = "evaluated by",
+  "has_evaluation"               = "evaluates",
+  "has_associated_finding"       = "presents with",
+  "associated_finding_of"        = "finding of",
+  "finding_of"                   = "is a finding of",
+  "has_finding"                  = "has finding",
+  "diagnoses"                    = "diagnoses",
+  "diagnosed_by"                 = "diagnosed by",
+  "component_of"                 = "component of",
+  "has_component"                = "has component",
+  "focus_of"                     = "focus of procedure",
+  "has_contraindicated_drug"     = "contraindicated drug",
+  "contraindicated_with_disease" = "contraindicated with",
+  "manifestation_of"             = "manifestation of",
+  "has_interpretation"           = "interpreted by",
+  "interprets"                   = "interprets",
+  "ingredient_of"                = "ingredient of",
+  "active_ingredient_of"         = "active ingredient of",
+  "active_moiety_of"             = "active moiety of",
+  "has_tradename"                = "tradename",
+  "tradename_of"                 = "tradename of",
+  "lexical_neighbor"             = "lexically related",
+  "associated_with"              = "associated with"
+)
+
+#' Vectorized display label for a rela vector.
+#' Unknown relas are humanized (underscore→space); empty rela → "related to".
+display_rela <- function(rela) {
+  rela <- as.character(rela)
+  rela[is.na(rela)] <- ""
+  out <- unname(RELA_DISPLAY[rela])
+  needs_humanize <- is.na(out)
+  if (any(needs_humanize)) {
+    humanized <- gsub("_", " ", rela[needs_humanize])
+    out[needs_humanize] <- humanized
+  }
+  out[is.na(out) | !nzchar(out)] <- "related to"
+  out
+}
+
+# ---------------------------------------------------------------------------
+# MRSTY → category map for post-walk reclassification
+# ---------------------------------------------------------------------------
+
+#' Semantic-type groups. Used to reroute concepts to their clinical category
+#' regardless of which UMLS rela surfaced them. Order matters: the first match
+#' wins per CUI, so list the most specific clinical types first.
+STY_TO_CATEGORY <- list(
+  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result"),
+  procedure      = c("Therapeutic or Preventive Procedure",
+                     "Diagnostic Procedure",
+                     "Health Care Activity"),
+  treatment      = c("Pharmacologic Substance", "Clinical Drug",
+                     "Antibiotic", "Vitamin", "Immunologic Factor",
+                     "Biologically Active Substance"),
+  anatomy        = c("Body Part, Organ, or Organ Component",
+                     "Body Location or Region",
+                     "Tissue", "Anatomical Structure", "Body System",
+                     "Cell", "Cell Component"),
+  comorbidity    = c("Disease or Syndrome", "Neoplastic Process",
+                     "Mental or Behavioral Dysfunction",
+                     "Pathologic Function", "Sign or Symptom",
+                     "Cell or Molecular Dysfunction",
+                     "Acquired Abnormality")
+)
+
+#' Reclassify rows of `rels` whose surfacing-rela bucket disagrees with their
+#' MRSTY semantic type. A concept whose intrinsic type is "Procedure" should
+#' appear in dag$procedures regardless of whether it was reached via
+#' `focus_of`, `inverse_isa`, or any other path.
+#'
+#' Rule: only promote rows whose current category is hierarchy-derived
+#' (subtype/parent) or non-specific (other/other_rela/associated/narrower/
+#' broader). Existing clinical assignments (treatment/comorbidity etc.) are
+#' preserved — we only fill gaps, never downgrade a specific category.
+reclassify_by_sty <- function(rels) {
+  if (is.null(rels) || nrow(rels) == 0) return(rels)
+  if (!"category" %in% names(rels) || !"related_cui" %in% names(rels)) return(rels)
+
+  stys <- umls_mrsty_for_cuis(unique(rels$related_cui))
+  if (nrow(stys) == 0) return(rels)
+
+  # First-match-by-priority category per CUI
+  sty_map <- stys |>
+    dplyr::group_by(cui) |>
+    dplyr::summarize(
+      sty_category = {
+        s <- unique(sty)
+        result <- NA_character_
+        for (cat in names(STY_TO_CATEGORY)) {
+          if (any(s %in% STY_TO_CATEGORY[[cat]])) { result <- cat; break }
+        }
+        result
+      },
+      .groups = "drop"
+    )
+
+  promote_from <- c("subtype", "parent", "other", "other_rela",
+                    "associated", "narrower", "broader")
+
+  rels |>
+    dplyr::left_join(sty_map, by = c("related_cui" = "cui")) |>
+    dplyr::mutate(
+      category = dplyr::case_when(
+        !is.na(sty_category) & category %in% promote_from ~ sty_category,
+        TRUE ~ category
+      )
+    ) |>
+    dplyr::select(-sty_category)
+}
+
 # Categories whose nodes are expanded further in BFS.
 # Labs, anatomy, procedures are leaves — collecting them is useful but
 # walking their children produces noise.
@@ -356,6 +490,12 @@ walk_concept_dag <- function(cui, max_depth = 2L, expand_n = 8L,
                        expand_n  = expand_n,
                        progress  = progress)
 
+  # MRSTY-based reclassification: route concepts to their clinical category
+  # by semantic type, not just by surfacing rela. Fixes the procedure-tab
+  # desync where procedure-flavored concepts arrive via inverse_isa and end
+  # up in `subtypes` instead of `procedures` (user-reported Atrial Tumor bug).
+  all_rels <- reclassify_by_sty(all_rels)
+
   extract <- function(cats) {
     # Preserve column structure even when no rows match — combine_dags's
     # bind_distinct uses dplyr::distinct(related_cui, ...) which crashes
@@ -422,7 +562,14 @@ combine_dags <- function(dag_a, dag_b,
     a2 <- a[, common, drop = FALSE]
     b2 <- b[, common, drop = FALSE]
     bound <- dplyr::bind_rows(a2, b2)
-    if ("related_cui" %in% names(bound)) {
+    # Relationships are edges, not nodes — dedupe on (from_cui, related_cui,
+    # rela) so click-to-extend can add an edge from the clicked concept back
+    # into an existing node. Keying solely on related_cui silently dropped
+    # those edges and was a major source of disconnected star clutter.
+    if (all(c("from_cui", "related_cui", "rela") %in% names(bound))) {
+      bound <- bound |>
+        dplyr::distinct(from_cui, related_cui, rela, .keep_all = TRUE)
+    } else if ("related_cui" %in% names(bound)) {
       bound <- bound |> dplyr::distinct(related_cui, .keep_all = TRUE)
     }
     bound
@@ -585,6 +732,78 @@ walk_concept_dag_dense <- function(cui, max_depth = 2L, expand_n = 8L,
         related_id_url = ""
       )
       base <- expand_via(base, candidates, "parent", max_calls = 2L)
+    }
+  }
+
+  # Tier 4: MRSTY-typed direct-neighbor fallback. When the standard walk +
+  # densifier still leaves procedures or labs empty, query mrrel_bidir
+  # joined to mrsty for direct neighbors of the seed CUI whose semantic
+  # type is procedure/lab. Closes the recall gap for narrow concepts whose
+  # surfacing rela is not in RELA_CATEGORIES.
+  base <- mrsty_typed_fallback(base, cui, progress = progress)
+
+  base
+}
+
+#' MRSTY-typed direct-neighbor fallback for empty procedure / lab buckets.
+#'
+#' Used after the standard densifier when categories of interest are still
+#' empty. Adds rows to base$procedures or base$diagnostic_labs (and to
+#' base$relations) with the same column shape as the BFS output, attributed
+#' from_cui = seed_cui so build_dag_network draws edges from the root.
+mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
+  if (is.null(base)) return(base)
+  if (!exists("umls_get_neighbors_by_sty", mode = "function")) return(base)
+
+  targets <- list(
+    procedure       = list(field = "procedures",
+                           stys  = STY_TO_CATEGORY$procedure),
+    diagnostic_lab  = list(field = "diagnostic_labs",
+                           stys  = STY_TO_CATEGORY$diagnostic_lab),
+    treatment       = list(field = "treatments",
+                           stys  = STY_TO_CATEGORY$treatment)
+  )
+
+  for (cat in names(targets)) {
+    field <- targets[[cat]]$field
+    current <- base[[field]]
+    if (!is.null(current) && nrow(current) > 0) next
+
+    if (!is.null(progress)) {
+      progress(paste0("MRSTY fallback: ", cat))
+    }
+    neigh <- tryCatch(
+      umls_get_neighbors_by_sty(seed_cui, targets[[cat]]$stys, limit = 25L),
+      error = function(e) NULL
+    )
+    if (is.null(neigh) || nrow(neigh) == 0) next
+
+    addn <- neigh |>
+      dplyr::mutate(
+        category = !!cat,
+        depth    = 1L,
+        via      = "sty_fallback",
+        from_cui = seed_cui
+      ) |>
+      dplyr::distinct(related_cui, .keep_all = TRUE)
+
+    base[[field]] <- if (is.null(current) || ncol(current) == 0) {
+      addn
+    } else {
+      common <- intersect(names(current), names(addn))
+      dplyr::bind_rows(current[, common, drop = FALSE],
+                       addn[, common, drop = FALSE]) |>
+        dplyr::distinct(related_cui, .keep_all = TRUE)
+    }
+
+    if (!is.null(base$relations) && nrow(base$relations) > 0) {
+      common <- intersect(names(base$relations), names(addn))
+      base$relations <- dplyr::bind_rows(
+        base$relations[, common, drop = FALSE],
+        addn[, common, drop = FALSE]
+      ) |> dplyr::distinct(related_cui, category, .keep_all = TRUE)
+    } else {
+      base$relations <- addn
     }
   }
   base

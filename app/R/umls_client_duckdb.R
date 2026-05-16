@@ -24,6 +24,128 @@ umls_db_available <- function() {
   !is.null(con)
 }
 
+# --- Name resolution (preferred + fallback chain) ---
+
+#' Bulk-resolve CUIs to human-readable preferred names.
+#'
+#' Lookup chain per CUI:
+#'   1. concept_preferred (canonical English PT)
+#'   2. mrconso English atom (any TTY, suppress NOT IN ('O','E'))
+#'   3. NA_character_ — caller decides what to do
+#'
+#' Returns a named character vector the same length as `cuis`, in the same
+#' order, with names = cuis. Never returns the CUI string itself; that is the
+#' bug we are explicitly closing here.
+umls_preferred_name <- function(cuis) {
+  cuis <- as.character(cuis)
+  cuis[is.na(cuis)] <- ""
+  out <- setNames(rep(NA_character_, length(cuis)), cuis)
+  uniq <- unique(cuis[nzchar(cuis)])
+  if (length(uniq) == 0) return(out)
+
+  con <- umls_db_connect()
+  if (is.null(con)) return(out)
+
+  ph <- paste(rep("?", length(uniq)), collapse = ",")
+  pref <- DBI::dbGetQuery(con, sprintf(
+    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)", ph),
+    params = as.list(uniq))
+  hit <- setNames(pref$preferred_name, pref$cui)
+
+  miss <- setdiff(uniq, names(hit))
+  if (length(miss) > 0) {
+    ph2 <- paste(rep("?", length(miss)), collapse = ",")
+    fb <- DBI::dbGetQuery(con, sprintf("
+      SELECT cui, str FROM (
+        SELECT cui, str,
+               row_number() OVER (
+                 PARTITION BY cui
+                 ORDER BY (ispref = 'Y') DESC, (ts = 'P') DESC, length(str)
+               ) rn
+        FROM mrconso
+        WHERE cui IN (%s) AND lat = 'ENG' AND suppress NOT IN ('O','E')
+      ) WHERE rn = 1", ph2), params = as.list(miss))
+    if (nrow(fb) > 0) hit <- c(hit, setNames(fb$str, fb$cui))
+  }
+
+  out[names(hit)[names(hit) %in% names(out)]] <-
+    hit[names(hit)[names(hit) %in% names(out)]]
+  out
+}
+
+#' Bulk MRSTY lookup. Returns a data frame with cui, sty (one row per pair).
+umls_mrsty_for_cuis <- function(cuis) {
+  cuis <- unique(as.character(cuis))
+  cuis <- cuis[nzchar(cuis) & !is.na(cuis)]
+  if (length(cuis) == 0) {
+    return(tibble::tibble(cui = character(0), sty = character(0)))
+  }
+  con <- umls_db_connect()
+  if (is.null(con)) return(tibble::tibble(cui = character(0), sty = character(0)))
+
+  ph <- paste(rep("?", length(cuis)), collapse = ",")
+  res <- tryCatch(DBI::dbGetQuery(con, sprintf(
+    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", ph),
+    params = as.list(cuis)), error = function(e) NULL)
+  if (is.null(res) || nrow(res) == 0) {
+    return(tibble::tibble(cui = character(0), sty = character(0)))
+  }
+  tibble::as_tibble(res)
+}
+
+#' Find UMLS neighbors of `cui` whose semantic type is in `stys`.
+#'
+#' Used by the densifier as a targeted MRSTY-typed fallback when the standard
+#' walk produces zero procedures or zero labs. Joins mrrel_bidir (relations)
+#' with mrsty (semantic type) and concept_preferred (display name).
+#'
+#' Returns a tibble shaped like umls_get_relations output: cui, related_cui,
+#' related_name, rel, rela, related_id_url.
+umls_get_neighbors_by_sty <- function(cui, stys, limit = 25L) {
+  if (length(stys) == 0) {
+    return(tibble::tibble(cui = character(0), related_cui = character(0),
+                          related_name = character(0), rel = character(0),
+                          rela = character(0), related_id_url = character(0)))
+  }
+  con <- umls_db_connect()
+  if (is.null(con)) {
+    return(tibble::tibble(cui = character(0), related_cui = character(0),
+                          related_name = character(0), rel = character(0),
+                          rela = character(0), related_id_url = character(0)))
+  }
+  ph <- paste(rep("?", length(stys)), collapse = ",")
+  res <- tryCatch(DBI::dbGetQuery(con, sprintf("
+    SELECT DISTINCT
+      r.cui1 AS cui,
+      r.cui2 AS related_cui,
+      cp.preferred_name AS related_name,
+      r.rel,
+      coalesce(r.rela, '') AS rela,
+      '' AS related_id_url
+    FROM mrrel_bidir r
+    JOIN mrsty s ON s.cui = r.cui2 AND s.sty IN (%s)
+    LEFT JOIN concept_preferred cp ON cp.cui = r.cui2
+    WHERE r.cui1 = ?
+      AND r.cui1 <> r.cui2
+    LIMIT ?", ph),
+    params = c(as.list(stys), list(cui, as.integer(limit)))),
+    error = function(e) NULL)
+  if (is.null(res) || nrow(res) == 0) {
+    return(tibble::tibble(cui = character(0), related_cui = character(0),
+                          related_name = character(0), rel = character(0),
+                          rela = character(0), related_id_url = character(0)))
+  }
+  res <- tibble::as_tibble(res)
+  # Backfill names that concept_preferred missed.
+  need <- is.na(res$related_name) | !nzchar(res$related_name) |
+          res$related_name == res$related_cui
+  if (any(need)) {
+    res$related_name[need] <- unname(umls_preferred_name(res$related_cui[need]))
+  }
+  # Drop rows that still couldn't resolve to a name.
+  res[!is.na(res$related_name) & nzchar(res$related_name), , drop = FALSE]
+}
+
 # --- Search ---
 
 #' Search UMLS for a concept by name
@@ -106,7 +228,7 @@ umls_get_relations <- function(cui) {
     SELECT
       r.cui1        AS cui,
       r.cui2        AS related_cui,
-      coalesce(cp.preferred_name, r.cui2) AS related_name,
+      cp.preferred_name AS related_name,
       r.rel,
       coalesce(r.rela, '') AS rela,
       ''            AS related_id_url
@@ -119,6 +241,17 @@ umls_get_relations <- function(cui) {
       !rela %in% c("translation_of", "has_translation"),
       nchar(related_cui) > 0
     )
+
+  # Backfill names that concept_preferred missed (mrconso English-atom fallback).
+  # Without this, related_name comes back NA and downstream code falls back to
+  # the CUI string, leaking bare CUIs onto graph node labels.
+  need_name <- is.na(bidir$related_name) | !nzchar(bidir$related_name)
+  if (any(need_name)) {
+    bidir$related_name[need_name] <- unname(
+      umls_preferred_name(bidir$related_cui[need_name])
+    )
+  }
+  bidir <- bidir |> dplyr::filter(!is.na(related_name), nzchar(related_name))
 
   # Layer 1b: MRHIER hierarchy edges — supplements MRREL's hierarchical
   # relations with paths that are encoded only in MRHIER (path-to-root view).

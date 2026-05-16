@@ -22,14 +22,20 @@
 )
 
 # Flatten dag_result to (nodes, edges) tibbles. Each node has id, label,
-# category. Each edge has from, to, rela, category. Suitable for any
-# downstream serialization.
+# category, cluster_id. Each edge has from, to, rela, rela_display, category,
+# cluster_id. Suitable for any downstream serialization.
+#
+# cluster_id is the weakly-connected component label from the rendered edge
+# set, so consumers can stratify by sub-DAG. rela_display is the user-friendly
+# label from RELA_DISPLAY; raw `rela` is kept for round-tripping.
 .dag_to_nodes_edges <- function(dag) {
   if (is.null(dag) || is.null(dag$concept)) {
     return(list(
-      nodes = tibble::tibble(id = character(0), label = character(0), category = character(0)),
+      nodes = tibble::tibble(id = character(0), label = character(0),
+                             category = character(0), cluster_id = integer(0)),
       edges = tibble::tibble(from = character(0), to = character(0),
-                             rela = character(0), category = character(0))
+                             rela = character(0), rela_display = character(0),
+                             category = character(0), cluster_id = integer(0))
     ))
   }
   root_id <- dag$concept$cui
@@ -60,9 +66,70 @@
 
   nodes <- purrr::list_rbind(c(list(root_node), unname(purrr::map(parts, "nodes")))) |>
     dplyr::distinct(id, .keep_all = TRUE)
-  edges <- purrr::list_rbind(unname(purrr::map(parts, "edges"))) |>
-    dplyr::distinct(from, to, rela, .keep_all = TRUE)
+  edges <- if (length(parts) > 0) {
+    purrr::list_rbind(unname(purrr::map(parts, "edges"))) |>
+      dplyr::distinct(from, to, rela, .keep_all = TRUE)
+  } else {
+    tibble::tibble(from = character(0), to = character(0),
+                   rela = character(0), category = character(0))
+  }
+
+  # rela_display column for human-readable downstream exports.
+  if (nrow(edges) > 0) {
+    edges$rela_display <- if (exists("display_rela", mode = "function")) {
+      display_rela(edges$rela)
+    } else {
+      gsub("_", " ", edges$rela)
+    }
+  } else {
+    edges$rela_display <- character(0)
+  }
+
+  # cluster_id: weakly-connected components on the rendered edge set.
+  # Used by downstream consumers to stratify by sub-DAG and by the viz to
+  # group disconnected stars under visClusterByGroup.
+  cluster_assignment <- .compute_cluster_ids(nodes, edges)
+  nodes$cluster_id <- cluster_assignment$nodes
+  edges$cluster_id <- cluster_assignment$edges
+
   list(nodes = nodes, edges = edges)
+}
+
+# Compute connected-component ids over the node/edge set. Returns
+# list(nodes = int vec aligned to nodes$id, edges = int vec aligned to edges).
+# Falls back to all-1L if igraph isn't installed.
+.compute_cluster_ids <- function(nodes, edges) {
+  n <- nrow(nodes)
+  if (n == 0) return(list(nodes = integer(0), edges = integer(0)))
+  if (!requireNamespace("igraph", quietly = TRUE) || nrow(edges) == 0) {
+    # Singletons each get their own cluster id when no edges connect them.
+    return(list(nodes = seq_len(n),
+                edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)))
+  }
+  # Edges may reference from_cui values that were not materialized as nodes
+  # (e.g. a click-extend that produced an edge from a concept whose only
+  # other rows landed in a category that was capped out). Drop those edges
+  # for the connectivity computation but keep them in the returned data —
+  # they still belong to the cluster of their visible endpoint.
+  in_nodes <- edges$from %in% nodes$id & edges$to %in% nodes$id
+  edges_for_graph <- edges[in_nodes, c("from", "to"), drop = FALSE]
+  g <- igraph::graph_from_data_frame(
+    d        = edges_for_graph,
+    vertices = data.frame(name = nodes$id, stringsAsFactors = FALSE),
+    directed = FALSE
+  )
+  comp <- igraph::components(g)
+  node_clusters <- as.integer(comp$membership[nodes$id])
+  node_clusters[is.na(node_clusters)] <- 0L
+  # Edge cluster = the cluster of its visible endpoint. Prefer `to` since
+  # `from` may be the dropped one. Falls back to 0L when neither resolves.
+  edge_clusters <- node_clusters[match(edges$to, nodes$id)]
+  na_idx <- is.na(edge_clusters)
+  if (any(na_idx)) {
+    edge_clusters[na_idx] <- node_clusters[match(edges$from[na_idx], nodes$id)]
+  }
+  edge_clusters[is.na(edge_clusters)] <- 0L
+  list(nodes = node_clusters, edges = edge_clusters)
 }
 
 # Best-effort biolink class for a category. Used by JSON-LD export.
@@ -158,24 +225,43 @@ export_jsonld <- function(dag) {
 }
 
 #' Export DAG as GraphML XML.
+#' Key ids are namespaced (node_* / edge_*) to keep the document
+#' well-formed — GraphML keys must be unique per attribute name within their
+#' `for` scope, and reusing the same id between node and edge keys breaks
+#' downstream parsers like yEd and Gephi.
 export_graphml <- function(dag) {
   ne <- .dag_to_nodes_edges(dag)
   esc <- .xml_escape
   node_lines <- if (nrow(ne$nodes) > 0) sprintf(
-    '    <node id="%s"><data key="label">%s</data><data key="category">%s</data></node>',
-    esc(ne$nodes$id), esc(ne$nodes$label), esc(ne$nodes$category)
+    paste0('    <node id="%s">',
+           '<data key="node_label">%s</data>',
+           '<data key="node_category">%s</data>',
+           '<data key="node_cluster">%s</data>',
+           '</node>'),
+    esc(ne$nodes$id), esc(ne$nodes$label), esc(ne$nodes$category),
+    esc(as.character(ne$nodes$cluster_id))
   ) else character(0)
   edge_lines <- if (nrow(ne$edges) > 0) sprintf(
-    '    <edge source="%s" target="%s"><data key="rela">%s</data><data key="category">%s</data></edge>',
-    esc(ne$edges$from), esc(ne$edges$to), esc(ne$edges$rela), esc(ne$edges$category)
+    paste0('    <edge source="%s" target="%s">',
+           '<data key="edge_rela">%s</data>',
+           '<data key="edge_rela_display">%s</data>',
+           '<data key="edge_category">%s</data>',
+           '<data key="edge_cluster">%s</data>',
+           '</edge>'),
+    esc(ne$edges$from), esc(ne$edges$to),
+    esc(ne$edges$rela), esc(ne$edges$rela_display),
+    esc(ne$edges$category), esc(as.character(ne$edges$cluster_id))
   ) else character(0)
   paste(c(
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
-    '  <key id="label"    for="node" attr.name="label"    attr.type="string"/>',
-    '  <key id="category" for="node" attr.name="category" attr.type="string"/>',
-    '  <key id="rela"     for="edge" attr.name="rela"     attr.type="string"/>',
-    '  <key id="category" for="edge" attr.name="category" attr.type="string"/>',
+    '  <key id="node_label"        for="node" attr.name="label"        attr.type="string"/>',
+    '  <key id="node_category"     for="node" attr.name="category"     attr.type="string"/>',
+    '  <key id="node_cluster"      for="node" attr.name="cluster_id"   attr.type="int"/>',
+    '  <key id="edge_rela"         for="edge" attr.name="rela"         attr.type="string"/>',
+    '  <key id="edge_rela_display" for="edge" attr.name="rela_display" attr.type="string"/>',
+    '  <key id="edge_category"     for="edge" attr.name="category"     attr.type="string"/>',
+    '  <key id="edge_cluster"      for="edge" attr.name="cluster_id"   attr.type="int"/>',
     sprintf('  <graph id="%s" edgedefault="directed">', esc(dag$concept$cui %||% "DAG")),
     node_lines,
     edge_lines,
@@ -225,7 +311,10 @@ export_mermaid <- function(dag, max_nodes = 80L) {
       sprintf('  %s["%s"]', sid(ne$nodes$id), sl(ne$nodes$label)),
     if (nrow(ne$edges) > 0)
       sprintf('  %s -->|%s| %s',
-              sid(ne$edges$from), sl(ne$edges$rela), sid(ne$edges$to))
+              sid(ne$edges$from),
+              sl(if ("rela_display" %in% names(ne$edges)) ne$edges$rela_display
+                  else ne$edges$rela),
+              sid(ne$edges$to))
   ), collapse = "\n")
 }
 
@@ -348,16 +437,28 @@ import_graphml <- function(path) {
                        sprintf("./data[@key='%s']", key)
     xml2::xml_text(xml2::xml_find_first(node, sel, ns = ns))
   }
+  # Read both the new namespaced keys (node_*, edge_*) and the legacy
+  # un-namespaced keys produced by older builds.
+  node_key <- function(node, name) {
+    v <- data_xpath(node, paste0("node_", name))
+    if (is.na(v) || !nzchar(v)) v <- data_xpath(node, name)
+    v
+  }
+  edge_key <- function(edge, name) {
+    v <- data_xpath(edge, paste0("edge_", name))
+    if (is.na(v) || !nzchar(v)) v <- data_xpath(edge, name)
+    v
+  }
   nodes <- tibble::tibble(
     id       = xml2::xml_attr(nx, "id"),
-    label    = vapply(nx, data_xpath, character(1), key = "label"),
-    category = vapply(nx, data_xpath, character(1), key = "category")
+    label    = vapply(nx, node_key, character(1), name = "label"),
+    category = vapply(nx, node_key, character(1), name = "category")
   )
   edges <- tibble::tibble(
     from     = xml2::xml_attr(ex, "source"),
     to       = xml2::xml_attr(ex, "target"),
-    rela     = vapply(ex, data_xpath, character(1), key = "rela"),
-    category = vapply(ex, data_xpath, character(1), key = "category")
+    rela     = vapply(ex, edge_key, character(1), name = "rela"),
+    category = vapply(ex, edge_key, character(1), name = "category")
   )
   .nodes_edges_to_dag(nodes, edges)
 }
