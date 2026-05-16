@@ -1,104 +1,99 @@
-# Review-Fix Loop — pico-dag (DRY-RUN, single-model validation pass)
+# Review-Fix Loop — pico-dag
 
-**Started:** 2026-05-14 ~20:42 UTC
-**Mode:** dry-run (no edits, no commits)
+**Started:** 2026-05-16 11:05 UTC
+**Mode:** production (real edits, real commits)
 **Starting commit:** `9fe0953c` (HEAD)
-**Stash:** `review-fix-loop dry-run snapshot 20260514-203924` (your WIP — restore at end)
-**Rounds run:** 1 (single-model validation only)
-**Models used:** `google-gemini-2.5-flash` (cheap pass — ~$0.05)
-**Target:** `app/R/dag_walker.R` (394 lines, ~2K tokens)
-**Why only one file:** `asksage_review.py` has a broken import (`create_llm_archive` missing from current `txtarchive.packunpack`) when reviewing whole directories. **Real bug surfaced — see "Issues with the tooling itself" below.** Single-file mode bypasses it.
+**Final commit:** `5936cc0`
+**Rounds run:** 2 full + 1 single-model spot + 1 convergence = converged in 4 logical passes
+**Models used:** `google-claude-47-opus`, `gpt-5`, `google-gemini-2.5-pro`, `grok-4-20-reasoning`
+**Target:** `/home/harlan/projects/pico-dag` (full Shiny app, ~196 KB archive, 6 R files + scripts)
 
----
+## Commits
 
-## Issues the loop would act on (P1 + P2)
+| SHA | Round | Scope |
+|---|---|---|
+| `3e158c9` | baseline | seal prior WIP (BFS density, exports, telemetry, MED-RT cache, DuckDB client) |
+| `bd14aa6` | round 2 | P1 user-flagged + 4-model consensus (label leakage, isa/inverse_isa, MRSTY reclassifier, MRSTY-typed densifier, cluster_id exports, combine_dags edge key, parent_drug_name crash, diagnostic_lab miscoloring, GraphML duplicate keys) |
+| `5936cc0` | round 4 | round-3 follow-ups: IN-list chunking, fallback threshold lowered, STY coverage expanded, link_row label leak, cluster_id fallback semantics, dead `umls_client.R` deleted |
 
-If this were a real run, the loop would attempt to fix these and commit.
+Round 1 was a prior dry-run validation pass (`reviews/round-1/gemini-2.5-flash.md` — single-file, ~$0.05). Round 2 was the first real multi-model production pass. Round 3 was a single-model claude-47-opus spot-check that flagged residuals → round 4 closed them. Round 5 single-model convergence verifier reported `CONVERGED`.
 
-### P1 — would fix and commit
+## User-reported issues, all resolved
 
-None confirmed. The "API key handling" callout is a check, not a known bug — it surfaces below as a P0 verification item.
+1. **Bare CUI labels (e.g. `C0018821`)** — `umls_preferred_name()` bulk resolver with concept_preferred → mrconso English fallback chain; SQL no longer emits CUI as name; last-mile resolver in `make_category_rows`; `clean_node_label` recovers any leaked bare CUI as `(unnamed CXXX)`.
+2. **`isa` / `inverse_isa` jargon** — `RELA_DISPLAY` lookup (50+ relas), `display_rela()`. Applied to edges + tooltips + CSV/GraphML/Mermaid exports.
+3. **Atrial Tumor procedures-tab/graph desync (C0741300)** — `reclassify_by_sty()` after BFS promotes hierarchy-surfaced concepts to their MRSTY-derived clinical category. Procedure CUIs that arrived via `inverse_isa` now populate `dag$procedures`.
+4. **Star-pattern clutter — grouping factor** — `cluster_id` computed via `igraph::components()` on the rendered edge set. Added to `nodes.csv` and `edges.csv`. (Viz-side `visClusterByGroup` deliberately surfaced as P0, not auto-applied — see below.)
+5. **CSV exports need grouping column** — `cluster_id` (int) + `rela_display` (human-readable) added to both `nodes.csv` and `edges.csv`. Mermaid uses `rela_display`; GraphML key ids namespaced (`node_*`/`edge_*`).
+6. **Sparse lab/procedure recall** — new tier-4 densifier `mrsty_typed_fallback()` joins `mrrel_bidir` with `mrsty` for direct neighbors of the seed when buckets are below `SPARSE_THRESHOLD=3`. Covers 38 semantic types across 5 categories.
+7. **General improvements** — see round-2 commit body.
 
-### P2 — would auto-fix and commit (4 items)
+## Other consensus fixes landed
 
-| # | Issue | Source location | Fix |
-|---|---|---|---|
-| 1 | `tryCatch` blocks silently swallow errors (return `NA`/`NULL` with no log) | `resolve_source_url_to_cui`, `bfs_walk` tryCatch handlers | Add `warning("...", call. = FALSE)` in each error handler before returning |
-| 2 | Manual `Sys.sleep()` rate limiting; modern pattern is `httr2::req_retry()` | `resolve_source_url_to_cui` httr2 chain | Add `req_retry(max_tries = 3, backoff = exponential)` before `req_perform()` |
-| 3 | No input validation on `root_cui`, `max_depth`, `expand_n` | `bfs_walk`, `walk_concept_dag` function tops | Add `stopifnot()` or `cli::cli_abort()` calls for invalid inputs |
-| 4 | External deps (`UMLS_BASE_URL`, `get_api_key`, `umls_get_relations`, `umls_get_concept`) not documented | Roxygen blocks for `walk_concept_dag` and `bfs_walk` | Add `@seealso` or `@details` listing where each is defined |
+- **`combine_dags::bind_distinct` edge-key bug** (claude-47-opus) — was keying solely on `related_cui`, silently dropping click-to-extend edges into existing nodes. Now `(from_cui, related_cui, rela)`. Major contributor to disconnected stars.
+- **`parent_drug_name` crash in `download_pull_request`** (claude + gpt-5) — column never existed; replaced with from_cui ↔ relations join.
+- **`diagnostic_labs` mis-rendered as monitoring_lab group, no distinct color** (gpt-5) — added `diagnostic_lab` color, routed correctly.
+- **GraphML duplicate `id="category"`** (gpt-5) — namespaced. Import path reads both new and legacy keys.
+- **`visGroups` hand-list** (claude P2) — driven from DOMAIN_COLORS via `purrr::reduce`.
+- **IN-list parameterization** (claude round-3) — `.umls_chunked_in` at chunk=500.
+- **MRSTY coverage gaps** (claude round-3) — added Injury or Poisoning, Congenital Abnormality, Hormone, Enzyme, Receptor, Steroid, Clinical Attribute, Molecular Biology Research Technique, etc. (13 new types).
+- **`extend_concept_dag` link_row label leak** (claude round-3) — `(not found)` stubs no longer reach the visible node label.
+- **Dead `app/R/umls_client.R`** (claude rounds 2 + 3) — finally deleted.
 
----
+## P0 still open — user decision needed
 
-## P0 — surfaced for your decision (2 items)
+These are deliberately not auto-applied because they're design decisions or scoped redesigns, not code defects.
 
-### 1. `monitoring_labs = tibble::tibble()` may be dead code or unfinished
+### 1. Star-clutter in the viz itself (cluster_id is in exports but not used by `build_dag_network`)
 
-In `walk_concept_dag` the return list contains:
+The infrastructure exists. `.compute_cluster_ids` could be lifted to a shared helper and used inside `network_viz.R::build_dag_network` to drive a `visNetwork::visClusterByGroup()` call. Recommendation: ~15-line change, gated behind a `checkboxInput("cluster_stars", "Group disconnected components", FALSE)` UI toggle. Default OFF so users who like the current spatial intuition aren't surprised.
 
-```r
-monitoring_labs = tibble::tibble() # kept for UI compatibility
+**Question for the user:** ship it default-off, or hold for a separate UX pass?
+
+### 2. `medrt_get_relations` synchronous fetch inside `umls_get_relations`
+
+Every per-node DB read inside BFS triggers up to 4 RxNav HTTP calls on a cache miss. First walk on an unseen seed is 10-30 seconds. Subsequent walks are fast (cache populated). Three options:
+
+- **Prefetch the seed + top-N neighbors before BFS starts** — narrow but predictable.
+- **Async (`future`, `mirai`) and merge results in a second pass** — better latency, more moving parts.
+- **At minimum, surface "Fetching drug relations from RxNav (one-time, ~30s)" in the progress callback** — no code restructuring.
+
+The third option could ship now without architectural change.
+
+### 3. MRSTY-first vs rela-first classification (architectural)
+
+Currently rela-first with MRSTY as a post-walk corrector. The round-2 reviews recommended flipping this: MRSTY as the primary classifier, rela as edge-label only. That's a bigger rewrite — wait until the post-walk corrector proves insufficient.
+
+### 4. PHI/search-term logging default
+
+`Incognito` is opt-in. For a clinical environment with PHI-adjacent text in search boxes (rare but possible), flip the default. Decision for the user.
+
+### 5. Per-session DuckDB connection
+
+`.umls_con` is a single global. DuckDB R driver isn't documented as thread-safe across concurrent queries on one connection. Bites at scale; harmless at low concurrency.
+
+### 6. Telemetry never records the rendered graph
+
+`dag_build` logs walker counts but not `n_rendered_nodes`, `n_rendered_edges`, `n_clipped_by_cap`, `cluster_count`. Without these we can't reproduce a user's "the graph looked weird" report.
+
+## Diff summary
+
+| File | +/- (across rounds 2 + 4) |
+|---|---|
+| `app/R/umls_client_duckdb.R` | new bulk resolver (`umls_preferred_name`), MRSTY helpers, IN-list chunking, SQL fallback |
+| `app/R/dag_walker.R` | RELA_DISPLAY, STY_TO_CATEGORY, reclassify_by_sty, mrsty_typed_fallback, combine_dags edge-key, link_row name fix |
+| `app/R/network_viz.R` | last-mile name resolution, display_rela, diagnostic_lab color, visGroups reduce |
+| `app/R/dag_export.R` | cluster_id, rela_display, namespaced GraphML keys, cluster_id fallback |
+| `app/app.R` | parent_drug_name fix in `download_pull_request` |
+| `app/R/umls_client.R` | deleted (dead code) |
+
+## Reviews preserved
+
 ```
-
-The reviewer notes that `diagnostic_labs` already extracts both `"diagnostic_lab"` and `"monitoring_lab"` categories. So either:
-
-- `monitoring_labs` should be populated by a separate extraction (currently a bug — UI sees empty)
-- `monitoring_labs` is dead and should be removed
-- The comment "kept for UI compatibility" is the true reason and the empty value is intentional
-
-**Decision needed:** populate, remove, or leave with clearer doc?
-
-### 2. `get_api_key()` source unverified
-
-Reviewer flags that the security posture depends on where `get_api_key()` retrieves the API key from. Not a known bug, but a sanity check worth confirming since the file isn't in this review's scope. Verify it reads from `Sys.getenv("UMLS_API_KEY")` (or similar env-var pattern) and not a hardcoded value or committed file.
-
----
-
-## Things the loop would NOT touch
-
-- "BFS queue efficiency" (reviewer explicitly says "unlikely to be a bottleneck for current parameters")
-- General praise (memoization, lazy resolution, modular structure)
-
----
-
-## Issues with the tooling itself (surfaced this run)
-
-1. **`asksage_review.py` calls `txtarchive.packunpack.create_llm_archive`** — function doesn't exist in current `txtarchive`. Closest available: `archive_subdirectories`, `concatenate_files`, or `run_concat`. **Action:** patch `asksage_review.py:104` to use the current API, OR add a compat shim in `txtarchive`. This blocks all directory-mode reviews via asksage today.
-
-2. **The loop's pre-flight stash worked correctly.** 4 modified + 5 untracked items captured, working tree now clean, can be restored.
-
----
-
-## How the loop would have run for real
-
-Had this been a non-dry-run with the full 4-model panel:
-
-```
-Round 1: 4 model calls, ~$3-5 total
-  Auto-fix: 4 P2 items (one commit, with warning+req_retry+stopifnot+roxygen)
-  Surface: 2 P0 items (monitoring_labs, get_api_key check)
-
-Round 2: re-review the modified file with the same 4 models
-  Either zero new issues → converge and stop
-  Or new issues → repeat fix-commit
-  Max 3 rounds total
-```
-
-The single-model dry-run here proves: review fetches work, output parses, categorization is sensible. The remaining unknowns are (a) whether the four models would agree (consensus = higher confidence), and (b) whether the auto-fixes hold under re-review.
-
----
-
-## Your one decision now
-
-Three possible next steps. Pick one or skip entirely:
-
-1. **Patch `asksage_review.py`** so directory-mode works → unblocks reviewing the whole `pico-dag/` at once, not file-by-file.
-2. **Run the loop for real** on `dag_walker.R` only (the four-model panel + commit fixes) → ~$3-5, leaves you with concrete commits to review.
-3. **Skip** — the dry-run validated the skill works; come back when you have ~30 minutes to do the real cycle.
-
-Either way: **your WIP is stashed** as `review-fix-loop dry-run snapshot 20260514-203924`. To restore:
-
-```bash
-cd ~/projects/pico-dag && git stash list
-cd ~/projects/pico-dag && git stash pop
+reviews/
+  review_prompt.md
+  round-1/  (prior single-model dry-run validation)
+  round-2/  (4-model production: claude-47-opus, gpt-5, gemini-2.5-pro, grok-4)
+  round-3/  (single-model claude residual scan → NEEDS-ROUND-4)
+  round-5-convergence.md  (single-model claude verifier → CONVERGED)
 ```

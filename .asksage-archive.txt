@@ -1,8 +1,8 @@
-# Archive created on: 2026-05-16 11:33:06
+# Archive created on: 2026-05-16 11:37:28
 
 # LLM-FRIENDLY CODE ARCHIVE
 # Generated from: /home/harlan/projects/pico-dag
-# Date: 2026-05-16 11:33:06
+# Date: 2026-05-16 11:37:28
 
 # TABLE OF CONTENTS
 1. .gitignore
@@ -16,17 +16,17 @@
 9. app/R/medrt_rxnav.R
 10. app/R/network_viz.R
 11. app/R/telemetry.R
-12. app/R/umls_client.R
-13. app/R/umls_client_duckdb.R
-14. app/app.R
-15. app/logs/events/20260507T215736.603-4m3hdm.json
-16. reviews/SUMMARY.md
-17. reviews/review_prompt.md
-18. reviews/round-1/gemini-2.5-flash.md
-19. reviews/round-2/claude-47-opus.md
-20. reviews/round-2/gemini-2.5-pro.md
-21. reviews/round-2/gpt-5.md
-22. reviews/round-2/grok-4.md
+12. app/R/umls_client_duckdb.R
+13. app/app.R
+14. app/logs/events/20260507T215736.603-4m3hdm.json
+15. reviews/SUMMARY.md
+16. reviews/review_prompt.md
+17. reviews/round-1/gemini-2.5-flash.md
+18. reviews/round-2/claude-47-opus.md
+19. reviews/round-2/gemini-2.5-pro.md
+20. reviews/round-2/gpt-5.md
+21. reviews/round-2/grok-4.md
+22. reviews/round-3/claude-47-opus.md
 23. scripts/add_mrhier_mrdef.R
 24. scripts/build_umls_db.R
 25. scripts/download_umls.sh
@@ -912,9 +912,13 @@ package_code_lists <- function(dag_result, pico_elements = list()) {
   n <- nrow(nodes)
   if (n == 0) return(list(nodes = integer(0), edges = integer(0)))
   if (!requireNamespace("igraph", quietly = TRUE) || nrow(edges) == 0) {
-    # Singletons each get their own cluster id when no edges connect them.
-    return(list(nodes = seq_len(n),
-                edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)))
+    # No edges (or no igraph available) → all nodes share cluster 1, since
+    # there's no connectivity information to split them on. Edges, if any,
+    # also belong to cluster 1.
+    return(list(
+      nodes = rep(1L, n),
+      edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)
+    ))
   }
   # Edges may reference from_cui values that were not materialized as nodes
   # (e.g. a click-extend that produced an edge from a concept whose only
@@ -1523,22 +1527,31 @@ display_rela <- function(rela) {
 #' regardless of which UMLS rela surfaced them. Order matters: the first match
 #' wins per CUI, so list the most specific clinical types first.
 STY_TO_CATEGORY <- list(
-  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result"),
+  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result",
+                     "Clinical Attribute"),
   procedure      = c("Therapeutic or Preventive Procedure",
                      "Diagnostic Procedure",
-                     "Health Care Activity"),
+                     "Health Care Activity",
+                     "Molecular Biology Research Technique"),
   treatment      = c("Pharmacologic Substance", "Clinical Drug",
                      "Antibiotic", "Vitamin", "Immunologic Factor",
-                     "Biologically Active Substance"),
+                     "Biologically Active Substance",
+                     "Hormone", "Enzyme", "Receptor", "Steroid",
+                     "Indicator, Reagent, or Diagnostic Aid",
+                     "Amino Acid, Peptide, or Protein"),
   anatomy        = c("Body Part, Organ, or Organ Component",
                      "Body Location or Region",
                      "Tissue", "Anatomical Structure", "Body System",
-                     "Cell", "Cell Component"),
+                     "Cell", "Cell Component",
+                     "Embryonic Structure", "Fully Formed Anatomical Structure"),
   comorbidity    = c("Disease or Syndrome", "Neoplastic Process",
                      "Mental or Behavioral Dysfunction",
                      "Pathologic Function", "Sign or Symptom",
                      "Cell or Molecular Dysfunction",
-                     "Acquired Abnormality")
+                     "Acquired Abnormality",
+                     "Congenital Abnormality",
+                     "Injury or Poisoning",
+                     "Anatomical Abnormality")
 )
 
 #' Reclassify rows of `rels` whose surfacing-rela bucket disagrees with their
@@ -1947,9 +1960,19 @@ combine_dags <- function(dag_a, dag_b,
   # clicked node is already in the graph and the new walk's from_cui values
   # naturally connect new edges to it.
   if (!is.null(link_rela)) {
+    # umls_get_concept returns a "(CXXX — not found)" stub when the CUI
+    # can't be resolved. That stub would land on the visible node label
+    # since clean_node_label's ^C\d+$ regex doesn't match it. Drop the
+    # stub here and let make_category_rows' last-mile resolver substitute
+    # an actual UMLS name (or the "(unnamed)" marker) instead.
+    link_name <- dag_b$concept$name
+    if (!is.null(link_name) &&
+        grepl("not found", link_name, fixed = TRUE)) {
+      link_name <- NA_character_
+    }
     link_row <- tibble::tibble(
       related_cui  = dag_b$concept$cui,
-      related_name = dag_b$concept$name,
+      related_name = link_name,
       rela         = link_rela,
       rel          = "",
       category     = link_category,
@@ -2129,10 +2152,15 @@ mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
                            stys  = STY_TO_CATEGORY$treatment)
   )
 
+  # Fire the fallback whenever the typed bucket is meaningfully sparse, not
+  # only when it's literally empty. One stray focus_of edge should not block
+  # the typed query from filling the bucket up to a useful size.
+  SPARSE_THRESHOLD <- 3L
+
   for (cat in names(targets)) {
     field <- targets[[cat]]$field
     current <- base[[field]]
-    if (!is.null(current) && nrow(current) > 0) next
+    if (!is.null(current) && nrow(current) >= SPARSE_THRESHOLD) next
 
     if (!is.null(progress)) {
       progress(paste0("MRSTY fallback: ", cat))
@@ -2149,8 +2177,14 @@ mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
         depth    = 1L,
         via      = "sty_fallback",
         from_cui = seed_cui
-      ) |>
-      dplyr::distinct(related_cui, .keep_all = TRUE)
+      )
+
+    # Dedupe on the same edge key combine_dags now uses, so a typed-fallback
+    # row whose related_cui already exists from a different from_cui doesn't
+    # collide with the existing edge.
+    dedupe_keys <- intersect(c("from_cui", "related_cui", "rela"), names(addn))
+    addn <- addn |> dplyr::distinct(dplyr::across(dplyr::all_of(dedupe_keys)),
+                                    .keep_all = TRUE)
 
     base[[field]] <- if (is.null(current) || ncol(current) == 0) {
       addn
@@ -2158,7 +2192,8 @@ mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
       common <- intersect(names(current), names(addn))
       dplyr::bind_rows(current[, common, drop = FALSE],
                        addn[, common, drop = FALSE]) |>
-        dplyr::distinct(related_cui, .keep_all = TRUE)
+        dplyr::distinct(dplyr::across(dplyr::all_of(
+          intersect(dedupe_keys, common))), .keep_all = TRUE)
     }
 
     if (!is.null(base$relations) && nrow(base$relations) > 0) {
@@ -2810,196 +2845,7 @@ safely_run <- function(expr, where, session_id = "", fallback = NULL,
 
 
 ################################################################################
-# FILE 12: app/R/umls_client.R
-################################################################################
-
-#' UMLS REST API client for pico-dag
-#'
-#' Wraps UMLS REST API v2 with httr2.
-#' API key from UMLS_API_KEY environment variable.
-
-# --- Configuration ---
-
-UMLS_BASE_URL <- "https://uts-ws.nlm.nih.gov/rest"
-
-get_api_key <- function() {
-  key <- Sys.getenv("UMLS_API_KEY", "")
-  if (nchar(key) == 0) {
-    stop("UMLS_API_KEY environment variable not set")
-  }
-  key
-}
-
-# --- Search ---
-
-#' Search UMLS for a concept by name
-#'
-#' @param term Character. Search term
-#' @param max_results Integer. Max results to return
-#' @return Tibble with cui, name, semantic_types
-umls_search <- function(term, max_results = 10) {
-  resp <- httr2::request(UMLS_BASE_URL) |>
-    httr2::req_url_path_append("search", "current") |>
-    httr2::req_url_query(
-      apiKey = get_api_key(),
-      string = term,
-      pageSize = max_results,
-      searchType = "words"
-    ) |>
-    httr2::req_perform() |>
-    httr2::resp_body_json()
-
-  results <- resp$result$results
-  if (length(results) == 0) return(tibble::tibble())
-
-  purrr::map(results, \(r) {
-    tibble::tibble(
-      cui = r$ui %||% "",
-      name = r$name %||% "",
-      root_source = r$rootSource %||% "",
-    )
-  }) |>
-    purrr::list_rbind()
-}
-
-# --- Concept details ---
-
-#' Get concept details by CUI
-#'
-#' @param cui Character. UMLS CUI
-#' @return List with name, semantic_types, atom_count
-umls_get_concept <- function(cui) {
-  # 404 / network failures must not crash the walk. Return a minimal stub
-  # so downstream code can still render an error-visible root node.
-  resp <- tryCatch({
-    httr2::request(UMLS_BASE_URL) |>
-      httr2::req_url_path_append("content", "current", "CUI", cui) |>
-      httr2::req_url_query(apiKey = get_api_key()) |>
-      httr2::req_perform() |>
-      httr2::resp_body_json()
-  }, error = function(e) NULL)
-
-  if (is.null(resp) || is.null(resp$result)) {
-    return(list(cui = cui, name = paste0("(", cui, " — not found)"),
-                semantic_types = character(0), atom_count = 0L,
-                not_found = TRUE))
-  }
-
-  result <- resp$result
-  list(
-    cui  = result$ui %||% cui,
-    name = result$name %||% "",
-    semantic_types = purrr::map_chr(
-      result$semanticTypes %||% list(),
-      \(st) st$name %||% ""
-    ),
-    atom_count = result$atomCount %||% 0
-  )
-}
-
-# --- Relations ---
-
-#' Get ALL relations for a CUI (paginated)
-#'
-#' @param cui Character. UMLS CUI
-#' @return Tibble with cui, related_cui, related_name, rel, rela
-umls_get_relations <- function(cui) {
-  all_results <- list()
-  page <- 1
-
-  repeat {
-    resp <- httr2::request(UMLS_BASE_URL) |>
-      httr2::req_url_path_append("content", "current", "CUI", cui, "relations") |>
-      httr2::req_url_query(
-        apiKey = get_api_key(),
-        pageSize = 200,
-        pageNumber = page
-      ) |>
-      httr2::req_perform() |>
-      httr2::resp_body_json()
-
-    results <- resp$result
-    if (length(results) == 0) break
-    all_results <- c(all_results, results)
-    if (length(results) < 200) break
-    page <- page + 1
-  }
-
-  if (length(all_results) == 0) return(tibble::tibble())
-
-  purrr::map(all_results, \(item) {
-    related_id <- item$relatedId %||% ""
-    tibble::tibble(
-      cui          = cui,
-      related_cui  = if (nchar(related_id) > 0) {
-        stringr::str_extract(related_id, "[^/]+$")
-      } else "",
-      related_name = item$relatedIdName %||% "",
-      rel          = item$relationLabel %||% "",
-      rela         = item$additionalRelationLabel %||% "",
-      related_id_url = related_id   # preserved for source-concept resolution
-    )
-  }) |>
-    purrr::list_rbind() |>
-    dplyr::filter(
-      !rela %in% c("translation_of", "has_translation"),
-      nchar(related_cui) > 0
-    ) |>
-    dplyr::distinct(related_cui, rela, .keep_all = TRUE)
-}
-
-# --- Source codes ---
-
-#' Get source codes for a CUI in a vocabulary
-#'
-#' @param cui Character. UMLS CUI
-#' @param vocabulary Character. e.g., "ICD10CM", "SNOMEDCT_US", "LNC", "RXNORM"
-#' @return Tibble with code, name, vocabulary
-umls_get_source_codes <- function(cui, vocabulary) {
-  all_codes <- list()
-  page <- 1
-
-  repeat {
-    resp <- httr2::request(UMLS_BASE_URL) |>
-      httr2::req_url_path_append("content", "current", "CUI", cui, "atoms") |>
-      httr2::req_url_query(
-        apiKey = get_api_key(),
-        sabs = vocabulary,
-        pageSize = 200,
-        pageNumber = page
-      ) |>
-      httr2::req_perform() |>
-      httr2::resp_body_json()
-
-    results <- resp$result
-    if (!is.list(results) || length(results) == 0) break
-
-    for (atom in results) {
-      code_uri <- atom$code %||% ""
-      code <- if (nchar(code_uri) > 0) {
-        stringr::str_extract(code_uri, "[^/]+$")
-      } else ""
-
-      all_codes[[length(all_codes) + 1]] <- tibble::tibble(
-        code = code,
-        name = atom$name %||% "",
-        vocabulary = vocabulary,
-        source_cui = cui,
-      )
-    }
-
-    if (length(results) < 200) break
-    page <- page + 1
-  }
-
-  if (length(all_codes) == 0) return(tibble::tibble())
-  purrr::list_rbind(all_codes) |>
-    dplyr::distinct(code, .keep_all = TRUE)
-}
-
-
-################################################################################
-# FILE 13: app/R/umls_client_duckdb.R
+# FILE 12: app/R/umls_client_duckdb.R
 ################################################################################
 
 #' UMLS DuckDB client for pico-dag
@@ -3030,6 +2876,27 @@ umls_db_available <- function() {
 
 # --- Name resolution (preferred + fallback chain) ---
 
+# DuckDB prepared statements can handle large IN-lists, but very long
+# string-built queries (one ? per CUI) become slow to parse. Chunk to keep
+# query strings bounded — a dense walk can produce 200-500 CUIs.
+.UMLS_IN_CHUNK <- 500L
+
+# Helper: run an IN-list query in fixed-size chunks and concatenate results.
+# `query_fmt` is sprintf with a single %s where the placeholder list goes.
+.umls_chunked_in <- function(con, query_fmt, ids, chunk = .UMLS_IN_CHUNK) {
+  ids <- unique(ids[!is.na(ids) & nzchar(ids)])
+  if (length(ids) == 0) return(NULL)
+  idx <- split(ids, ceiling(seq_along(ids) / chunk))
+  parts <- lapply(idx, function(g) {
+    ph <- paste(rep("?", length(g)), collapse = ",")
+    tryCatch(DBI::dbGetQuery(con, sprintf(query_fmt, ph), params = as.list(g)),
+             error = function(e) NULL)
+  })
+  parts <- parts[!vapply(parts, is.null, logical(1))]
+  if (length(parts) == 0) return(NULL)
+  do.call(rbind, parts)
+}
+
 #' Bulk-resolve CUIs to human-readable preferred names.
 #'
 #' Lookup chain per CUI:
@@ -3050,16 +2917,14 @@ umls_preferred_name <- function(cuis) {
   con <- umls_db_connect()
   if (is.null(con)) return(out)
 
-  ph <- paste(rep("?", length(uniq)), collapse = ",")
-  pref <- DBI::dbGetQuery(con, sprintf(
-    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)", ph),
-    params = as.list(uniq))
-  hit <- setNames(pref$preferred_name, pref$cui)
+  pref <- .umls_chunked_in(con,
+    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)",
+    uniq)
+  hit <- if (is.null(pref)) character(0) else setNames(pref$preferred_name, pref$cui)
 
   miss <- setdiff(uniq, names(hit))
   if (length(miss) > 0) {
-    ph2 <- paste(rep("?", length(miss)), collapse = ",")
-    fb <- DBI::dbGetQuery(con, sprintf("
+    fb <- .umls_chunked_in(con, "
       SELECT cui, str FROM (
         SELECT cui, str,
                row_number() OVER (
@@ -3068,8 +2933,10 @@ umls_preferred_name <- function(cuis) {
                ) rn
         FROM mrconso
         WHERE cui IN (%s) AND lat = 'ENG' AND suppress NOT IN ('O','E')
-      ) WHERE rn = 1", ph2), params = as.list(miss))
-    if (nrow(fb) > 0) hit <- c(hit, setNames(fb$str, fb$cui))
+      ) WHERE rn = 1", miss)
+    if (!is.null(fb) && nrow(fb) > 0) {
+      hit <- c(hit, setNames(fb$str, fb$cui))
+    }
   }
 
   out[names(hit)[names(hit) %in% names(out)]] <-
@@ -3087,10 +2954,8 @@ umls_mrsty_for_cuis <- function(cuis) {
   con <- umls_db_connect()
   if (is.null(con)) return(tibble::tibble(cui = character(0), sty = character(0)))
 
-  ph <- paste(rep("?", length(cuis)), collapse = ",")
-  res <- tryCatch(DBI::dbGetQuery(con, sprintf(
-    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", ph),
-    params = as.list(cuis)), error = function(e) NULL)
+  res <- .umls_chunked_in(con,
+    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", cuis)
   if (is.null(res) || nrow(res) == 0) {
     return(tibble::tibble(cui = character(0), sty = character(0)))
   }
@@ -3523,7 +3388,7 @@ umls_get_source_codes_rest <- function(cui, vocabulary) {
 
 
 ################################################################################
-# FILE 14: app/app.R
+# FILE 13: app/app.R
 ################################################################################
 
 #' pico-dag: PICO-Driven Clinical Research Accelerator
@@ -4433,14 +4298,14 @@ shinyApp(ui, server)
 
 
 ################################################################################
-# FILE 15: app/logs/events/20260507T215736.603-4m3hdm.json
+# FILE 14: app/logs/events/20260507T215736.603-4m3hdm.json
 ################################################################################
 
 {"ts":"2026-05-08T01:57:36Z","event_type":"app_error","session":"ac031dd7ce78a364","data":{"where":"test_handler","message":"simulated database failure","call":"force(expr)"}}
 
 
 ################################################################################
-# FILE 16: reviews/SUMMARY.md
+# FILE 15: reviews/SUMMARY.md
 ################################################################################
 
 # Review-Fix Loop — pico-dag (DRY-RUN, single-model validation pass)
@@ -4550,7 +4415,7 @@ cd ~/projects/pico-dag && git stash pop
 
 
 ################################################################################
-# FILE 17: reviews/review_prompt.md
+# FILE 16: reviews/review_prompt.md
 ################################################################################
 
 You are reviewing the `pico-dag` R/Shiny application. It's a clinical-research DAG explorer backed by UMLS (DuckDB at `/srv/umls/umls.duckdb`) and augmented by RxNav MED-RT drug-disease relations. Users search for a clinical concept (CUI or term), and the app walks the UMLS graph to surface related treatments, comorbidities, procedures, labs, anatomy, subtypes, parents, and etiologies, then renders an interactive visNetwork DAG and per-category data tables, with CSV/GraphML export.
@@ -4602,7 +4467,7 @@ Be specific: name files and functions. Quote the offending code. If you're unsur
 
 
 ################################################################################
-# FILE 18: reviews/round-1/gemini-2.5-flash.md
+# FILE 17: reviews/round-1/gemini-2.5-flash.md
 ################################################################################
 
 
@@ -4712,7 +4577,7 @@ Overall, this is a very high-quality piece of code. The suggestions are primaril
 [3] Wickham, H. (2023). *httr2: Perform HTTP Requests and Process Responses*. R package version 1.0.0. Retrieved from [https://httr2.r-lib.org/](https://httr2.r-lib.org/)
 
 ################################################################################
-# FILE 19: reviews/round-2/claude-47-opus.md
+# FILE 18: reviews/round-2/claude-47-opus.md
 ################################################################################
 
 
@@ -5128,7 +4993,7 @@ The Incognito checkbox is good UX, but the **default** is "log everything", incl
 Everything else (MED-RT prefetch redesign, per-session DB connections, telemetry coverage, privacy default) is real work but not on the critical path for the user-reported bugs.
 
 ################################################################################
-# FILE 20: reviews/round-2/gemini-2.5-pro.md
+# FILE 19: reviews/round-2/gemini-2.5-pro.md
 ################################################################################
 
 
@@ -5369,7 +5234,7 @@ Here is a punch list of the first 5 actions I would take, ordered by impact-to-e
 5.  **Add Clustering to the Network Viz (P0, Issue 4):** Implement `visClusteringByGroup`. This directly addresses the "star pattern" clutter and dramatically improves the exploratory power of the visualization.
 
 ################################################################################
-# FILE 21: reviews/round-2/gpt-5.md
+# FILE 20: reviews/round-2/gpt-5.md
 ################################################################################
 
 
@@ -5615,7 +5480,7 @@ Here is a punch list of the first 5 actions I would take, ordered by impact-to-e
 If you want me to supply follow-on patches (cluster_id in CSV, export display_rela, and an igraph-based component computation) I can draft them next.
 
 ################################################################################
-# FILE 22: reviews/round-2/grok-4.md
+# FILE 21: reviews/round-2/grok-4.md
 ################################################################################
 
 
@@ -5717,6 +5582,68 @@ label = RELA_DISPLAY[data$rela] %||% data$rela,
 - **Add `cluster_id` column to `.dag_to_nodes_edges`** (using the same igraph components logic) and update `export_csv_zip` — low effort, high downstream value.
 
 These five changes close every prioritized user-reported issue with minimal new architecture. The remaining P0 decisions (rela vs semantic primacy, DuckDB-only path) can be taken after the immediate bugs are gone.
+
+################################################################################
+# FILE 22: reviews/round-3/claude-47-opus.md
+################################################################################
+
+
+
+## Still Open (P1)
+
+**1. `umls_preferred_name()` bulk lookup is unparameterized for large IN-lists.**
+`app/R/umls_client_duckdb.R` `umls_preferred_name()` and `umls_mrsty_for_cuis()` build `IN (?,?,...)` with one placeholder per CUI. DuckDB has a parameter cap (~1000 by default via prepared statement limits) and string-building cost is O(n). `reclassify_by_sty()` in `dag_walker.R` passes `unique(rels$related_cui)` — for a dense walk this can be 200-500 CUIs per call, and it's called once per `walk_concept_dag` plus once per `combine_dags`-merged sub-walk in the densifier. **Fix:** chunk to 500 or use a temp table / `dbWriteTable` + join.
+
+**2. `mrsty_typed_fallback()` only fills if category is _completely_ empty.**
+`app/R/dag_walker.R` ~line 660: `if (!is.null(current) && nrow(current) > 0) next`. A seed that surfaces 1 procedure via `focus_of` skips the MRSTY fallback entirely, leaving a meaningful recall gap. **Fix:** lower threshold (e.g. `< 3`) or always run and dedupe.
+
+**3. `reclassify_by_sty()` `dplyr::summarize` with imperative loop is O(n_cuis × n_categories) per group.**
+The `for (cat in names(STY_TO_CATEGORY))` inside `summarize()` runs per-CUI in R; for a 400-CUI walk this is the dominant cost after the DB query. **Fix:** unnest `STY_TO_CATEGORY` to a `tibble(sty, category, priority)`, single join + `slice_min(priority)`.
+
+## Newly Surfaced (P0)
+
+**4. Star-clutter architecturally still open — `cluster_id` exists in exports but not in the viz.**
+You correctly flagged this. `network_viz.R` `build_dag_network()` does NOT compute components or call `visClusterByGroup`. The infrastructure (igraph in `.compute_cluster_ids`) is already paid for in `dag_export.R`. **Recommendation:** extract `.compute_cluster_ids` to a shared helper and call it in `build_dag_network` before the `visNetwork()` constructor, then add `visClusterByGroup(groups = unique(paste0("cluster_", nodes$cluster_id)))` behind a UI toggle (`checkboxInput("cluster_stars", "Group disconnected components", FALSE)`). Default OFF — clustering changes the spatial intuition and some users will hate it.
+
+**5. `STY_TO_CATEGORY` coverage gaps.**
+Missing semantic types I'd expect to see surfaced:
+- **procedure:** `"Molecular Biology Research Technique"` (genomic assays), `"Research Activity"` (rare but appears for clinical trials)
+- **diagnostic_lab:** `"Clinical Attribute"` (e.g. vital signs that LOINC also covers), `"Quantitative Concept"` is too broad to add safely
+- **treatment:** `"Hormone"`, `"Enzyme"`, `"Receptor"` (used for biologics), `"Steroid"`, `"Indicator, Reagent, or Diagnostic Aid"` (contrast agents — borderline, could argue for procedure)
+- **comorbidity:** `"Congenital Abnormality"`, `"Injury or Poisoning"`, `"Anatomical Abnormality"` (covers many ICD-10 codes), `"Experimental Model of Disease"` (rare in clinical data)
+- **anatomy:** `"Embryonic Structure"`, `"Fully Formed Anatomical Structure"`, `"Gene or Genome"` if you want genetic-anatomy
+
+The Injury/Poisoning and Congenital Abnormality gaps will bite for trauma and pediatric seeds specifically.
+
+**6. New label-leakage path: `extend_concept_dag` synthetic root link.**
+`dag_walker.R` `combine_dags()` with `link_rela != NULL` constructs `link_row` with `related_name = dag_b$concept$name`. If `umls_get_concept` returned the `"(C123 — not found)"` stub (network failure or genuinely missing CUI), that stub string lands in the graph as a node label and `clean_node_label()`'s `^C\d+$` regex won't match it. Low-frequency but real for transient DuckDB hiccups. **Fix:** in `umls_get_concept` set `name <- NA_character_` on not-found and let `make_category_rows`' last-mile resolver handle it.
+
+**7. `medrt_get_relations` still called inside `umls_get_relations` synchronously per node.**
+Not new — flagged in round 2 Claude — but the round-3 changes added more DB roundtrips per node (MRHIER join + concept_preferred backfill) without addressing this. First-walk latency on an unseen seed remains 10-30s. Not a regression but worth re-flagging since it now compounds with the MRSTY query cost in #1.
+
+## Untouched files spot-check
+
+**`app/R/medrt_rxnav.R`:**
+- `.rxcuis_to_umls_cuis` builds an IN-list with no chunking (same risk as #1; RxNav can return hundreds of RxCUIs per class).
+- `medrt_cache_lookup`/`store` opens+closes a DuckDB connection on every call. For a 30-node BFS that's 60 connection cycles. Switch to a long-lived read connection with separate short-lived writes, mirroring the UMLS pattern.
+- `.MEDRT_CACHE_PATH` resolution at source-load time uses `getwd()` if `PICO_LOG_DIR` unset — same wd-dependency footgun as `telemetry.R`.
+
+**`app/R/telemetry.R`:**
+- Looks clean. One nit: `.daily_salt()` reads the salt file on every `log_event` call with no in-memory cache. Cheap (it's a 1-line file) but unnecessary I/O on hot paths.
+- `safely_run` doesn't capture the traceback (only the message + immediate call). For diagnosing the `dag_walker.R` chain failures you'll want `rlang::trace_back()` or at least `sys.calls()` in the error handler.
+
+**`app/R/umls_client.R`:**
+- Still present as dead code. `app/app.R` only sources `umls_client_duckdb.R`. Round-2 Claude flagged this for deletion; still not done. Risk of shadowing if anyone adds a test harness or runs scripts that source it. **Delete it** — the `_rest` shims in `umls_client_duckdb.R` cover its functionality.
+
+## Style/Lint (P2)
+
+- `dag_walker.R` `mrsty_typed_fallback()` line ~670: `base[[field]]` re-binds with `dplyr::bind_rows` but the dedupe key is `related_cui` alone — inconsistent with the round-3 `bind_distinct` fix that keys on `(from_cui, related_cui, rela)`. Use the same key.
+- `dag_export.R` `.dag_to_nodes_edges` `cluster_id` defaults to `seq_len(n)` when igraph absent — that's "every node is its own cluster" which is technically wrong (singletons should be 0 or NA, connected pairs should share). Minor.
+- `network_viz.R` `clean_node_label` does both regex stripping AND CUI recovery. Split into `recover_label()` + `truncate_label()` so the recovery step is testable in isolation.
+
+## Convergence assessment: NEEDS-ROUND-4
+
+Three reasons: (a) the IN-list parameterization (#1) is a latent production crash waiting for a sufficiently dense seed; (b) the star-clutter architectural fix (#4) is explicitly punted but you have all the infrastructure to land it in ~15 lines; (c) `umls_client.R` still hasn't been deleted across two rounds. One more focused round closes all three.
 
 ################################################################################
 # FILE 23: scripts/add_mrhier_mrdef.R
