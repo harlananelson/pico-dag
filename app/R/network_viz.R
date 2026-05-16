@@ -13,8 +13,22 @@ DOMAIN_COLORS <- c(
   "outcome" = "#E74C3C",       # red (same as population)
   "intervention" = "#1ABC9C",  # teal
   "comparator" = "#16A085",    # dark teal
+  "etiology"   = "#C0392B",    # deep red
   "other" = "#7F8C8D"          # dark gray
 )
+
+# Strip generic UMLS scaffolding phrases before truncating node labels.
+# Vectorized: gsub/sub/str_trunc all operate elementwise on character vectors.
+clean_node_label <- function(x, max_chars = 32) {
+  x <- ifelse(is.na(x), "", as.character(x))
+  y <- gsub("\\s+", " ", x)
+  y <- sub("^Disorder characterized by\\s+", "", y, ignore.case = TRUE)
+  y <- sub("^Disease or Syndrome\\s*:?\\s*", "", y, ignore.case = TRUE)
+  y <- sub("^Finding of\\s+", "", y, ignore.case = TRUE)
+  y <- sub("^Morphologic abnormality\\s*:?\\s*", "", y, ignore.case = TRUE)
+  y <- sub("\\s*\\((disease|disorder|finding|procedure|morphologic abnormality)\\)\\s*$", "", y, ignore.case = TRUE)
+  ifelse(nzchar(y), stringr::str_trunc(y, width = max_chars, side = "right"), "")
+}
 
 #' Build visNetwork graph from DAG results
 #'
@@ -29,7 +43,7 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
   root_id <- dag_result$concept$cui
   nodes_list[[1]] <- tibble::tibble(
     id = root_id,
-    label = dag_result$concept$name,
+    label = clean_node_label(dag_result$concept$name, max_chars = 40),
     group = "population",
     title = paste0(
       "<b>", dag_result$concept$name, "</b><br>",
@@ -40,75 +54,58 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     size = 30
   )
 
-  # Add relation nodes and edges
-  add_category <- function(data, category, max_nodes = 30) {
-    if (nrow(data) == 0) return()
-    data <- utils::head(data, max_nodes)
-
-    for (i in seq_len(nrow(data))) {
-      node_id <- data$related_cui[i]
-      if (node_id == root_id) next
-
-      nodes_list[[length(nodes_list) + 1]] <<- tibble::tibble(
-        id = node_id,
-        label = stringr::str_trunc(data$related_name[i], 30),
-        group = category,
-        title = paste0(
-          "<b>", data$related_name[i], "</b><br>",
-          "CUI: ", node_id, "<br>",
-          "Relationship: ", data$rela[i]
-        ),
-        shape = "dot",
-        size = 15
-      )
-
-      edges_list[[length(edges_list) + 1]] <<- tibble::tibble(
-        from = root_id,
-        to = node_id,
-        label = data$rela[i],
-        arrows = "to",
-        color = DOMAIN_COLORS[category] %||% "#7F8C8D"
-      )
+  # Vectorized: returns list(nodes=tibble, edges=tibble).
+  # Edges originate from each row's `from_cui` when present (so densified /
+  # extended walks correctly attribute relations to the right anchor node).
+  # The max_nodes cap is applied PER-anchor (per from_cui), so an extended
+  # walk can add up to max_nodes new edges per clicked node without being
+  # crowded out by the original root's edges.
+  make_category_rows <- function(data, category, max_nodes = 30) {
+    if (nrow(data) == 0) return(list(nodes = NULL, edges = NULL))
+    data <- data[data$related_cui != root_id, , drop = FALSE]
+    if (nrow(data) == 0) return(list(nodes = NULL, edges = NULL))
+    if (!"from_cui" %in% names(data)) {
+      data$from_cui <- root_id
+    } else {
+      data$from_cui[is.na(data$from_cui) | !nzchar(data$from_cui)] <- root_id
     }
+    data <- data |>
+      dplyr::group_by(from_cui) |>
+      dplyr::slice_head(n = max_nodes) |>
+      dplyr::ungroup()
+    edge_from <- data$from_cui
+    nodes <- tibble::tibble(
+      id    = data$related_cui,
+      label = clean_node_label(data$related_name),
+      group = category,
+      title = paste0("<b>", data$related_name, "</b><br>CUI: ", data$related_cui,
+                     "<br>Relationship: ", data$rela),
+      shape = "dot",
+      size  = 15
+    )
+    edges <- tibble::tibble(
+      from   = edge_from,
+      to     = data$related_cui,
+      label  = data$rela,
+      arrows = "to",
+      color  = DOMAIN_COLORS[category] %||% "#7F8C8D"
+    )
+    list(nodes = nodes, edges = edges)
   }
 
-  add_category(dag_result$treatments, "treatment")
-  add_category(dag_result$comorbidities, "comorbidity")
-  add_category(dag_result$procedures, "procedure")
-  add_category(dag_result$anatomy, "anatomy")
-  add_category(dag_result$subtypes, "subtype", max_nodes = 10)
-
-  # Monitoring labs (second-hop edges from drugs)
-  if (nrow(dag_result$monitoring_labs) > 0) {
-    ml <- dag_result$monitoring_labs |>
-      dplyr::distinct(related_cui, .keep_all = TRUE) |>
-      utils::head(40)
-
-    for (i in seq_len(nrow(ml))) {
-      lab_id <- ml$related_cui[i]
-
-      nodes_list[[length(nodes_list) + 1]] <- tibble::tibble(
-        id = lab_id,
-        label = stringr::str_trunc(ml$related_name[i], 25),
-        group = "monitoring_lab",
-        title = paste0(
-          "<b>", ml$related_name[i], "</b><br>",
-          "Monitors: ", ml$parent_drug_name[i]
-        ),
-        shape = "triangle",
-        size = 10
-      )
-
-      edges_list[[length(edges_list) + 1]] <- tibble::tibble(
-        from = ml$parent_drug_cui[i],
-        to = lab_id,
-        label = "monitors",
-        arrows = "to",
-        dashes = TRUE,
-        color = DOMAIN_COLORS["monitoring_lab"]
-      )
-    }
-  }
+  cats <- list(
+    make_category_rows(dag_result$treatments,      "treatment",      max_nodes = 15),
+    make_category_rows(dag_result$comorbidities,   "comorbidity",    max_nodes = 15),
+    make_category_rows(dag_result$procedures,      "procedure",      max_nodes = 15),
+    make_category_rows(dag_result$anatomy,         "anatomy",        max_nodes = 10),
+    make_category_rows(dag_result$subtypes,        "subtype",        max_nodes = 15),
+    make_category_rows(dag_result$parents,         "parent",         max_nodes =  6),
+    make_category_rows(dag_result$diagnostic_labs, "monitoring_lab", max_nodes = 15),
+    if (!is.null(dag_result$etiology)) make_category_rows(dag_result$etiology, "etiology", max_nodes = 8)
+    else list(nodes = NULL, edges = NULL)
+  )
+  nodes_list <- c(nodes_list, purrr::map(cats, "nodes"))
+  edges_list <- c(edges_list, purrr::map(cats, "edges"))
 
   # PICO element nodes
   for (elem in pico_elements) {
@@ -139,6 +136,25 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     tibble::tibble(from = character(), to = character())
   }
 
+  # Hard cap on graph size to keep visNetwork's force-directed layout
+  # responsive in the browser. visNetwork starts to choke past ~200 nodes
+  # because Atlas2-based physics is O(n^2). When over the cap we keep the
+  # root, all PICO-element nodes, and the most-connected remaining nodes
+  # (ranked by edge degree). Edges are then filtered to only those whose
+  # endpoints survive.
+  MAX_RENDERED_NODES <- 180L
+  if (nrow(nodes) > MAX_RENDERED_NODES) {
+    must_keep <- c(root_id,
+                   nodes$id[nodes$group %in% c("intervention", "comparator", "outcome")])
+    deg_tbl <- table(c(edges$from, edges$to))
+    deg <- as.integer(deg_tbl[as.character(nodes$id)])
+    deg[is.na(deg)] <- 0L
+    priority <- ifelse(nodes$id %in% must_keep, 1e9, deg)
+    keep_ids <- nodes$id[order(-priority)][seq_len(MAX_RENDERED_NODES)]
+    nodes <- nodes[nodes$id %in% keep_ids, , drop = FALSE]
+    edges <- edges[edges$from %in% keep_ids & edges$to %in% keep_ids, , drop = FALSE]
+  }
+
   # Build visNetwork
   visNetwork::visNetwork(nodes, edges, width = "100%", height = "600px") |>
     visNetwork::visGroups(groupname = "population", color = DOMAIN_COLORS["population"]) |>
@@ -148,6 +164,8 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     visNetwork::visGroups(groupname = "procedure", color = DOMAIN_COLORS["procedure"]) |>
     visNetwork::visGroups(groupname = "anatomy", color = DOMAIN_COLORS["anatomy"]) |>
     visNetwork::visGroups(groupname = "subtype", color = DOMAIN_COLORS["subtype"]) |>
+    visNetwork::visGroups(groupname = "parent", color = DOMAIN_COLORS["parent"]) |>
+    visNetwork::visGroups(groupname = "etiology", color = DOMAIN_COLORS["etiology"]) |>
     visNetwork::visGroups(groupname = "intervention", color = DOMAIN_COLORS["intervention"]) |>
     visNetwork::visGroups(groupname = "comparator", color = DOMAIN_COLORS["comparator"]) |>
     visNetwork::visLegend(useGroups = TRUE, position = "right") |>
@@ -159,5 +177,8 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
       solver = "forceAtlas2Based",
       forceAtlas2Based = list(gravitationalConstant = -100)
     ) |>
-    visNetwork::visInteraction(navigationButtons = TRUE)
+    visNetwork::visInteraction(navigationButtons = TRUE) |>
+    visNetwork::visEvents(
+      selectNode = "function(nodes) { Shiny.setInputValue('dag_node_click', nodes.nodes[0], {priority: 'event'}); }"
+    )
 }

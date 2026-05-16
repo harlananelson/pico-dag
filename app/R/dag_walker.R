@@ -233,8 +233,9 @@ bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
       umls_get_relations(effective_cui) |>
         categorize_relations() |>
         dplyr::mutate(
-          depth = node$depth,
-          via   = node$via
+          depth    = node$depth,
+          via      = node$via,
+          from_cui = effective_cui    # who these relations came from
         )
     }, error = \(e) NULL)
 
@@ -301,12 +302,31 @@ bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
     Sys.sleep(0.15)
   }
 
-  if (length(all_rels) == 0) return(tibble::tibble())
+  if (length(all_rels) == 0) return(.empty_relations_tibble())
 
   purrr::list_rbind(all_rels) |>
     # Keep first occurrence of each (related_cui, category) pair —
     # shallowest path wins (queue is FIFO so depth order is preserved)
     dplyr::distinct(related_cui, category, .keep_all = TRUE)
+}
+
+# Canonical zero-row, fully-typed relations tibble. Returned when a walk
+# produces no relations (true UMLS leaf, 404, network failure). All
+# downstream code assumes these columns exist; an empty tibble with no
+# columns crashes dplyr verbs that reference `related_cui` etc.
+.empty_relations_tibble <- function() {
+  tibble::tibble(
+    cui            = character(0),
+    related_cui    = character(0),
+    related_name   = character(0),
+    rel            = character(0),
+    rela           = character(0),
+    related_id_url = character(0),
+    category       = character(0),
+    depth          = integer(0),
+    via            = character(0),
+    from_cui       = character(0)
+  )
 }
 
 # ---------------------------------------------------------------------------
@@ -337,7 +357,9 @@ walk_concept_dag <- function(cui, max_depth = 2L, expand_n = 8L,
                        progress  = progress)
 
   extract <- function(cats) {
-    if (nrow(all_rels) == 0) return(tibble::tibble())
+    # Preserve column structure even when no rows match — combine_dags's
+    # bind_distinct uses dplyr::distinct(related_cui, ...) which crashes
+    # on a 0-column tibble.
     all_rels |> dplyr::filter(category %in% cats)
   }
 
@@ -354,9 +376,278 @@ walk_concept_dag <- function(cui, max_depth = 2L, expand_n = 8L,
     genetic          = extract("genetic"),
     interpretation   = extract("interpretation"),
     contraindications = extract("contraindication"),
-    diagnostic_labs  = extract(c("diagnostic_lab", "monitoring_lab")),
-    monitoring_labs  = tibble::tibble()   # kept for UI compatibility
+    diagnostic_labs  = extract("diagnostic_lab"),
+    monitoring_labs  = extract("monitoring_lab")
   )
+}
+
+#' Count visible nodes a DAG would produce in build_dag_network.
+.dag_visible_count <- function(dag) {
+  if (is.null(dag) || is.null(dag$concept)) return(0L)
+  1L +  # root
+    nrow(dag$treatments)      +
+    nrow(dag$comorbidities)   +
+    nrow(dag$procedures)      +
+    nrow(dag$diagnostic_labs) +
+    nrow(dag$anatomy)         +
+    nrow(dag$subtypes)        +
+    nrow(dag$parents)         +
+    nrow(dag$etiology)
+}
+
+#' Merge dag_b's relations into dag_a, attributing them to dag_b$concept.
+#'
+#' Each row already carries `from_cui` (the concept whose relations produced
+#' it). For relations from dag_b, from_cui is dag_b$concept$cui or its BFS
+#' descendants — meaning edges in build_dag_network will originate from the
+#' right anchor automatically.
+#'
+#' Caller can pass link_via = list(rela = "isa") to record how dag_a$concept
+#' connects to dag_b$concept. The link is added as a "parent" or "subtype"
+#' row attributed from_cui = dag_a$concept$cui.
+#'
+#' Both DAGs must have populated $concept; concept is preserved from dag_a.
+combine_dags <- function(dag_a, dag_b,
+                         link_rela = "isa",
+                         link_category = "parent") {
+  if (is.null(dag_b) || is.null(dag_b$concept)) return(dag_a)
+
+  bind_distinct <- function(a, b) {
+    if (is.null(b) || nrow(b) == 0) return(a)
+    # If `a` was an untyped empty tibble (no columns), adopt b's structure
+    # so dplyr verbs below can find `related_cui`.
+    if (is.null(a) || ncol(a) == 0) a <- b[FALSE, , drop = FALSE]
+    common <- intersect(names(a), names(b))
+    if (length(common) == 0) return(a)
+    a2 <- a[, common, drop = FALSE]
+    b2 <- b[, common, drop = FALSE]
+    bound <- dplyr::bind_rows(a2, b2)
+    if ("related_cui" %in% names(bound)) {
+      bound <- bound |> dplyr::distinct(related_cui, .keep_all = TRUE)
+    }
+    bound
+  }
+
+  result <- dag_a
+
+  # Optional synthetic link row connecting dag_a$concept → dag_b$concept.
+  # Skipped when link_rela=NULL — used by extend_concept_dag because the
+  # clicked node is already in the graph and the new walk's from_cui values
+  # naturally connect new edges to it.
+  if (!is.null(link_rela)) {
+    link_row <- tibble::tibble(
+      related_cui  = dag_b$concept$cui,
+      related_name = dag_b$concept$name,
+      rela         = link_rela,
+      rel          = "",
+      category     = link_category,
+      depth        = 0L,
+      via          = NA_character_,
+      from_cui     = dag_a$concept$cui
+    )
+    cat_for_link <- switch(link_category,
+                           parent  = "parents",
+                           subtype = "subtypes",
+                           "parents")
+    result[[cat_for_link]] <- bind_distinct(result[[cat_for_link]], link_row)
+  }
+
+  result$treatments      <- bind_distinct(result$treatments,      dag_b$treatments)
+  result$comorbidities   <- bind_distinct(result$comorbidities,   dag_b$comorbidities)
+  result$procedures      <- bind_distinct(result$procedures,      dag_b$procedures)
+  result$diagnostic_labs <- bind_distinct(result$diagnostic_labs, dag_b$diagnostic_labs)
+  result$monitoring_labs <- bind_distinct(result$monitoring_labs, dag_b$monitoring_labs)
+  result$anatomy         <- bind_distinct(result$anatomy,         dag_b$anatomy)
+  result$subtypes        <- bind_distinct(result$subtypes,        dag_b$subtypes)
+  result$parents         <- bind_distinct(result$parents,         dag_b$parents)
+  result$etiology        <- bind_distinct(result$etiology,        dag_b$etiology)
+
+  if (!is.null(dag_b$relations) && nrow(dag_b$relations) > 0) {
+    common <- intersect(names(result$relations), names(dag_b$relations))
+    result$relations <- dplyr::bind_rows(
+      result$relations[, common, drop = FALSE],
+      dag_b$relations[, common, drop = FALSE]
+    ) |> dplyr::distinct(related_cui, category, .keep_all = TRUE)
+  }
+  result
+}
+
+#' Densified DAG walk: standard walk + parent/sibling supplementation.
+#'
+#' Strategy:
+#'   1. Standard walk_concept_dag at the seed CUI.
+#'   2. If visible-node count < min_visible AND root has parents:
+#'        a. Walk the first parent (depth 1, cheap).
+#'        b. Merge into result with the parent linked via `isa`.
+#'   3. If still sparse, walk the first subtype (depth 1) and merge.
+#'   4. Stop — further expansion crosses too many semantic boundaries.
+#'
+#' Each merged sub-walk's relations carry their own from_cui values so that
+#' build_dag_network draws edges from the correct anchor concept.
+walk_concept_dag_dense <- function(cui, max_depth = 2L, expand_n = 8L,
+                                   min_visible = 25L, progress = NULL) {
+  base <- walk_concept_dag(cui, max_depth = max_depth,
+                           expand_n = expand_n, progress = progress)
+
+  if (.dag_visible_count(base) >= min_visible) return(base)
+
+  # Generic single-word catch-all parents are noise — walking them returns
+  # only hierarchy relations to other generic concepts. Skip these by name.
+  GENERIC_PARENTS <- c("syndrome", "disease", "disorder", "finding",
+                       "condition", "abnormality", "process", "procedure")
+  is_generic_name <- function(n) {
+    if (is.na(n)) return(TRUE)
+    tolower(trimws(n)) %in% GENERIC_PARENTS
+  }
+
+  # Resolve a row's CUI: return its UMLS CUI directly, or resolve from
+  # source URL if the row is a SNOMED/RxNorm/etc id. NA if unresolvable.
+  resolve_row_cui <- function(row) {
+    if (is_umls_cui(row$related_cui)) return(row$related_cui)
+    url <- if ("related_id_url" %in% names(row)) row$related_id_url else ""
+    if (is.na(url) || !nzchar(url)) return(NA_character_)
+    cui <- resolve_source_url_to_cui(url)
+    if (is.na(cui) || !is_umls_cui(cui)) NA_character_ else cui
+  }
+
+  # Walk a list of candidate rows in order, merging each, until we cross
+  # the visibility threshold or exhaust the list. Caps API calls at `max_calls`.
+  expand_via <- function(base, candidates, link_category, max_calls = 4L) {
+    if (is.null(candidates) || nrow(candidates) == 0) return(base)
+    calls <- 0L
+    for (i in seq_len(nrow(candidates))) {
+      if (calls >= max_calls) break
+      if (.dag_visible_count(base) >= min_visible) break
+      row <- candidates[i, , drop = FALSE]
+      if (is_generic_name(row$related_name)) next
+      target_cui <- resolve_row_cui(row)
+      if (is.na(target_cui)) next
+      if (!is.null(progress)) {
+        progress(paste0("Densifying via ", link_category, ": ", row$related_name))
+      }
+      # Use depth=2 so that walking a sparse parent still picks up its
+      # parent-of-parent relations — handles chains of leaf concepts where
+      # each link in the chain has only one relation (its own parent).
+      sub_depth <- if (link_category == "parent") 2L else 1L
+      sub_dag <- tryCatch(
+        walk_concept_dag(target_cui, max_depth = sub_depth, expand_n = expand_n),
+        error = function(e) NULL
+      )
+      calls <- calls + 1L
+      if (is.null(sub_dag)) next
+      base <- combine_dags(
+        base, sub_dag,
+        link_rela = row$rela %||% (if (link_category == "parent") "isa" else "inverse_isa"),
+        link_category = link_category
+      )
+    }
+    base
+  }
+
+  # Tier 1: parents (walk up to 4)
+  base <- expand_via(base, base$parents, "parent", max_calls = 4L)
+  if (.dag_visible_count(base) >= min_visible) return(base)
+
+  # Tier 2: subtypes (walk up to 2)
+  base <- expand_via(base, base$subtypes, "subtype", max_calls = 2L)
+  if (.dag_visible_count(base) >= min_visible) return(base)
+
+  # Tier 3: progressive-truncation lexical search. Concept has no neighbors
+  # via parents or subtypes — search increasingly broad name variants to
+  # find a non-leaf umbrella concept. Handles OMIM-style suffixed names
+  # ("VENTRICULAR TACHYCARDIA, CATECHOLAMINERGIC POLYMORPHIC, 3" →
+  #  "VENTRICULAR TACHYCARDIA, CATECHOLAMINERGIC POLYMORPHIC" →
+  #  "VENTRICULAR TACHYCARDIA").
+  cname <- base$concept$name %||% ""
+  if (nzchar(cname) && !grepl("not found", cname, fixed = TRUE)) {
+    cname <- sub("\\s*\\([^)]+\\)\\s*$", "", cname)        # strip "(disorder)"
+    queries <- unique(c(
+      cname,
+      sub(",[^,]+$", "", cname),                          # drop trailing comma-clause
+      sub(",[^,]+,[^,]+$", "", cname),                    # drop two trailing clauses
+      stringr::word(cname, 1L, 2L),                       # first two words only
+      stringr::word(cname, 1L, 1L)                        # first word only
+    ))
+    queries <- queries[nzchar(queries) & nchar(queries) >= 4L]
+    queries <- queries[!duplicated(tolower(queries))]
+    for (q in queries) {
+      if (.dag_visible_count(base) >= min_visible) break
+      if (!is.null(progress)) progress(paste0("Trying lexical neighbors: \"", q, "\""))
+      hits <- tryCatch(umls_search(q, max_results = 5L),
+                       error = function(e) tibble::tibble())
+      if (nrow(hits) == 0) next
+      hits <- hits[hits$cui != base$concept$cui, , drop = FALSE]
+      if (nrow(hits) == 0) next
+      candidates <- tibble::tibble(
+        related_cui    = hits$cui,
+        related_name   = hits$name,
+        rela           = "lexical_neighbor",
+        related_id_url = ""
+      )
+      base <- expand_via(base, candidates, "parent", max_calls = 2L)
+    }
+  }
+  base
+}
+
+#' Extend an existing DAG by walking a clicked node and merging.
+#'
+#' The clicked node's id may be a UMLS CUI ("C0004238") or a source-vocab
+#' identifier (RxNorm "736680", SNOMED "429211003", AUI "A1617387"). For
+#' non-CUI ids, the function looks up the original `related_id_url` from the
+#' existing DAG's relations and resolves it to a UMLS CUI before walking.
+#'
+#' Returns the existing DAG unchanged if the click cannot be resolved to a
+#' walkable concept or the walk produces no new relations.
+extend_concept_dag <- function(existing_dag, new_id,
+                               max_depth = 1L, expand_n = 8L,
+                               progress = NULL) {
+  if (is.null(new_id) || !nzchar(new_id)) return(existing_dag)
+
+  # Resolve to a UMLS CUI
+  cui <- if (is_umls_cui(new_id)) {
+    new_id
+  } else {
+    if (!is.null(progress)) progress("Resolving source-vocab id...")
+    rels <- existing_dag$relations
+    if (is.null(rels) || nrow(rels) == 0) return(existing_dag)
+    if (!"related_id_url" %in% names(rels)) return(existing_dag)
+    matches <- rels[rels$related_cui == new_id & nzchar(rels$related_id_url %||% ""), ,
+                    drop = FALSE]
+    if (nrow(matches) == 0) return(existing_dag)
+    resolved <- tryCatch(resolve_source_url_to_cui(matches$related_id_url[1]),
+                         error = function(e) NA_character_)
+    if (is.na(resolved) || !is_umls_cui(resolved)) return(existing_dag)
+    resolved
+  }
+
+  if (!is.null(progress)) progress(paste0("Expanding around ", cui, "..."))
+  new_walk <- tryCatch(
+    walk_concept_dag(cui, max_depth = max_depth, expand_n = expand_n,
+                     progress = progress),
+    error = function(e) NULL
+  )
+  if (is.null(new_walk) || isTRUE(new_walk$concept$not_found)) return(existing_dag)
+
+  # Rewrite from_cui in the new walk's relations: BFS attributed them to the
+  # resolved UMLS CUI, but the rendered graph's node id is the original
+  # source-vocab id the user clicked. Use that so edges connect correctly.
+  if (cui != new_id && !is.null(new_walk$relations) && nrow(new_walk$relations) > 0) {
+    new_walk$relations$from_cui[new_walk$relations$from_cui == cui] <- new_id
+    rewrite_cat <- function(tbl) {
+      if (is.null(tbl) || nrow(tbl) == 0) return(tbl)
+      if ("from_cui" %in% names(tbl)) {
+        tbl$from_cui[tbl$from_cui == cui] <- new_id
+      }
+      tbl
+    }
+    for (k in c("treatments","comorbidities","procedures","diagnostic_labs",
+                "monitoring_labs","anatomy","subtypes","parents","etiology")) {
+      new_walk[[k]] <- rewrite_cat(new_walk[[k]])
+    }
+  }
+
+  combine_dags(existing_dag, new_walk, link_rela = NULL)
 }
 
 #' Walk a single PICO element (intervention, comparator, or outcome).

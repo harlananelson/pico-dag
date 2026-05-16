@@ -54,15 +54,25 @@ umls_search <- function(term, max_results = 10) {
 #' @param cui Character. UMLS CUI
 #' @return List with name, semantic_types, atom_count
 umls_get_concept <- function(cui) {
-  resp <- httr2::request(UMLS_BASE_URL) |>
-    httr2::req_url_path_append("content", "current", "CUI", cui) |>
-    httr2::req_url_query(apiKey = get_api_key()) |>
-    httr2::req_perform() |>
-    httr2::resp_body_json()
+  # 404 / network failures must not crash the walk. Return a minimal stub
+  # so downstream code can still render an error-visible root node.
+  resp <- tryCatch({
+    httr2::request(UMLS_BASE_URL) |>
+      httr2::req_url_path_append("content", "current", "CUI", cui) |>
+      httr2::req_url_query(apiKey = get_api_key()) |>
+      httr2::req_perform() |>
+      httr2::resp_body_json()
+  }, error = function(e) NULL)
+
+  if (is.null(resp) || is.null(resp$result)) {
+    return(list(cui = cui, name = paste0("(", cui, " — not found)"),
+                semantic_types = character(0), atom_count = 0L,
+                not_found = TRUE))
+  }
 
   result <- resp$result
   list(
-    cui = result$ui %||% cui,
+    cui  = result$ui %||% cui,
     name = result$name %||% "",
     semantic_types = purrr::map_chr(
       result$semanticTypes %||% list(),
