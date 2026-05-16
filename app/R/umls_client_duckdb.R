@@ -8,12 +8,43 @@
 UMLS_DB_PATH <- "/srv/umls/umls.duckdb"
 
 # --- Connection management ---
+#
+# DuckDB connections are scoped per Shiny session when one is available, so
+# concurrent sessions in the same R process don't share a single connection
+# (the R driver isn't documented as thread-safe across concurrent queries
+# on one connection). Outside Shiny — scripts, console, tests — a process-
+# global connection is used.
+#
+# Connection lifecycle:
+#   in-session: stored in session$userData$.umls_con, closed on session end
+#   global:     stored in .umls_con, lives until R exits
 
 .umls_con <- NULL
 
 umls_db_connect <- function() {
-  if (!is.null(.umls_con) && DBI::dbIsValid(.umls_con)) return(.umls_con)
   if (!file.exists(UMLS_DB_PATH)) return(NULL)
+
+  # Try per-session first when running inside a Shiny reactive context.
+  session <- if (requireNamespace("shiny", quietly = TRUE)) {
+    tryCatch(shiny::getDefaultReactiveDomain(), error = function(e) NULL)
+  } else NULL
+
+  if (!is.null(session)) {
+    con <- session$userData$.umls_con
+    if (!is.null(con) && DBI::dbIsValid(con)) return(con)
+    con <- DBI::dbConnect(duckdb::duckdb(), UMLS_DB_PATH, read_only = TRUE)
+    session$userData$.umls_con <- con
+    # Auto-close the connection when the session ends so we don't leak
+    # file handles across Shiny worker reuse.
+    session$onSessionEnded(function() {
+      tryCatch(DBI::dbDisconnect(con, shutdown = TRUE),
+               error = function(e) NULL)
+    })
+    return(con)
+  }
+
+  # Process-global path (scripts, tests, console).
+  if (!is.null(.umls_con) && DBI::dbIsValid(.umls_con)) return(.umls_con)
   con <- DBI::dbConnect(duckdb::duckdb(), UMLS_DB_PATH, read_only = TRUE)
   assign(".umls_con", con, envir = .GlobalEnv)
   con

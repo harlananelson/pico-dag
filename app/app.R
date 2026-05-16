@@ -97,15 +97,29 @@ ui <- page_navbar(
     ),
     hr(),
 
-    # Privacy
+    # Privacy. Default ON: this tool is used in clinical-research contexts
+    # where search boxes can pick up PHI-adjacent free text. Logging is
+    # opt-in, not opt-out. Users who want to contribute to tool improvement
+    # can uncheck the box.
     checkboxInput("incognito_mode",
       label = HTML("&#128274; Incognito — don't log my searches"),
+      value = TRUE),
+    tags$div(
+      style = "font-size: 0.75rem; color: #6c757d; margin-top: -8px;",
+      "Default: logging is OFF. Uncheck to anonymously log searches",
+      tags$br(),
+      "(session ID hashed daily) to help improve the tool."
+    ),
+    hr(),
+    # Visualization options
+    checkboxInput("cluster_stars",
+      label = "Group disconnected stars",
       value = FALSE),
     tags$div(
       style = "font-size: 0.75rem; color: #6c757d; margin-top: -8px;",
-      "Default: search terms and DAG actions are logged anonymously",
+      "Collapses off-seed components into expandable cluster nodes.",
       tags$br(),
-      "(session ID hashed daily) to improve the tool."
+      "Useful when the graph shows multiple disconnected sub-DAGs."
     )
   ),
 
@@ -360,15 +374,30 @@ server <- function(input, output, session) {
           )
         }
       })
+      # Walker counts come from the dag_result tibbles; render stats come
+      # from a dry-run of the same node/edge assembly + cap logic that
+      # build_dag_network uses. Together they let us diagnose "the graph
+      # looked weird" reports without seeing the user's screen.
+      render_stats <- tryCatch(
+        summarize_dag_render(rv$dag_result),
+        error = function(e) list()
+      )
       track("dag_build",
-        cui               = rv$pop_cui,
-        concept_name      = rv$dag_result$concept$name,
-        n_treatments      = nrow(rv$dag_result$treatments),
-        n_comorbidities   = nrow(rv$dag_result$comorbidities),
-        n_procedures      = nrow(rv$dag_result$procedures),
-        n_diagnostic_labs = nrow(rv$dag_result$diagnostic_labs),
-        n_parents         = nrow(rv$dag_result$parents),
-        not_found         = isTRUE(rv$dag_result$concept$not_found)
+        cui                   = rv$pop_cui,
+        concept_name          = rv$dag_result$concept$name,
+        n_treatments          = nrow(rv$dag_result$treatments),
+        n_comorbidities       = nrow(rv$dag_result$comorbidities),
+        n_procedures          = nrow(rv$dag_result$procedures),
+        n_diagnostic_labs     = nrow(rv$dag_result$diagnostic_labs),
+        n_parents             = nrow(rv$dag_result$parents),
+        not_found             = isTRUE(rv$dag_result$concept$not_found),
+        n_rendered_nodes      = render_stats$n_rendered_nodes      %||% NA_integer_,
+        n_rendered_edges      = render_stats$n_rendered_edges      %||% NA_integer_,
+        n_clipped_by_cap      = render_stats$n_clipped_by_cap      %||% NA_integer_,
+        cluster_count         = render_stats$cluster_count         %||% NA_integer_,
+        n_unnamed_nodes       = render_stats$n_unnamed_nodes       %||% NA_integer_,
+        n_components_off_root = render_stats$n_components_off_root %||% NA_integer_,
+        has_etiology          = render_stats$has_etiology          %||% FALSE
       )
     })
   })
@@ -503,7 +532,9 @@ server <- function(input, output, session) {
   # --- DAG Network ---
   output$dag_network <- renderVisNetwork({
     req(rv$dag_result)
-    safe(where = "render_dag_network", expr = build_dag_network(rv$dag_result))
+    safe(where = "render_dag_network",
+         expr = build_dag_network(rv$dag_result,
+                                  cluster_components = isTRUE(input$cluster_stars)))
   })
 
   # --- Value boxes ---

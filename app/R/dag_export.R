@@ -95,46 +95,8 @@
   list(nodes = nodes, edges = edges)
 }
 
-# Compute connected-component ids over the node/edge set. Returns
-# list(nodes = int vec aligned to nodes$id, edges = int vec aligned to edges).
-# Falls back to all-1L if igraph isn't installed.
-.compute_cluster_ids <- function(nodes, edges) {
-  n <- nrow(nodes)
-  if (n == 0) return(list(nodes = integer(0), edges = integer(0)))
-  if (!requireNamespace("igraph", quietly = TRUE) || nrow(edges) == 0) {
-    # No edges (or no igraph available) → all nodes share cluster 1, since
-    # there's no connectivity information to split them on. Edges, if any,
-    # also belong to cluster 1.
-    return(list(
-      nodes = rep(1L, n),
-      edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)
-    ))
-  }
-  # Edges may reference from_cui values that were not materialized as nodes
-  # (e.g. a click-extend that produced an edge from a concept whose only
-  # other rows landed in a category that was capped out). Drop those edges
-  # for the connectivity computation but keep them in the returned data —
-  # they still belong to the cluster of their visible endpoint.
-  in_nodes <- edges$from %in% nodes$id & edges$to %in% nodes$id
-  edges_for_graph <- edges[in_nodes, c("from", "to"), drop = FALSE]
-  g <- igraph::graph_from_data_frame(
-    d        = edges_for_graph,
-    vertices = data.frame(name = nodes$id, stringsAsFactors = FALSE),
-    directed = FALSE
-  )
-  comp <- igraph::components(g)
-  node_clusters <- as.integer(comp$membership[nodes$id])
-  node_clusters[is.na(node_clusters)] <- 0L
-  # Edge cluster = the cluster of its visible endpoint. Prefer `to` since
-  # `from` may be the dropped one. Falls back to 0L when neither resolves.
-  edge_clusters <- node_clusters[match(edges$to, nodes$id)]
-  na_idx <- is.na(edge_clusters)
-  if (any(na_idx)) {
-    edge_clusters[na_idx] <- node_clusters[match(edges$from[na_idx], nodes$id)]
-  }
-  edge_clusters[is.na(edge_clusters)] <- 0L
-  list(nodes = node_clusters, edges = edge_clusters)
-}
+# `.compute_cluster_ids` lives in network_viz.R so both this exporter and
+# the renderer (build_dag_network) can share one implementation.
 
 # Best-effort biolink class for a category. Used by JSON-LD export.
 .biolink_type <- function(cat) {

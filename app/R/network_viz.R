@@ -1,5 +1,44 @@
 #' Network visualization for the concept DAG
 
+# ---------------------------------------------------------------------------
+# Shared helpers (used by both build_dag_network and dag_export.R)
+# ---------------------------------------------------------------------------
+
+#' Compute connected-component (cluster) ids over a node/edge set.
+#'
+#' Returns list(nodes = int vec aligned to nodes$id,
+#'              edges = int vec aligned to edges).
+#' Lives in network_viz.R so both the renderer (visClusterByGroup) and the
+#' exporter (.dag_to_nodes_edges) can call it. Falls back to all-1L when no
+#' edges exist or igraph is unavailable.
+.compute_cluster_ids <- function(nodes, edges) {
+  n <- nrow(nodes)
+  if (n == 0) return(list(nodes = integer(0), edges = integer(0)))
+  if (!requireNamespace("igraph", quietly = TRUE) || nrow(edges) == 0) {
+    return(list(
+      nodes = rep(1L, n),
+      edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)
+    ))
+  }
+  in_nodes <- edges$from %in% nodes$id & edges$to %in% nodes$id
+  edges_for_graph <- edges[in_nodes, c("from", "to"), drop = FALSE]
+  g <- igraph::graph_from_data_frame(
+    d        = edges_for_graph,
+    vertices = data.frame(name = nodes$id, stringsAsFactors = FALSE),
+    directed = FALSE
+  )
+  comp <- igraph::components(g)
+  node_clusters <- as.integer(comp$membership[nodes$id])
+  node_clusters[is.na(node_clusters)] <- 0L
+  edge_clusters <- node_clusters[match(edges$to, nodes$id)]
+  na_idx <- is.na(edge_clusters)
+  if (any(na_idx)) {
+    edge_clusters[na_idx] <- node_clusters[match(edges$from[na_idx], nodes$id)]
+  }
+  edge_clusters[is.na(edge_clusters)] <- 0L
+  list(nodes = node_clusters, edges = edge_clusters)
+}
+
 # Domain → color mapping
 DOMAIN_COLORS <- c(
   "population"     = "#E74C3C", # red
@@ -48,8 +87,13 @@ clean_node_label <- function(x, max_chars = 32, cuis = NULL) {
 #'
 #' @param dag_result List from walk_concept_dag()
 #' @param pico_elements List of PICO element results
+#' @param cluster_components If TRUE, collapse weakly-connected components
+#'        in the rendered graph via visClusterByGroup. Default FALSE so the
+#'        spatial intuition of the un-clustered graph is preserved unless
+#'        the user explicitly opts in.
 #' @return visNetwork object
-build_dag_network <- function(dag_result, pico_elements = list()) {
+build_dag_network <- function(dag_result, pico_elements = list(),
+                              cluster_components = FALSE) {
   nodes_list <- list()
   edges_list <- list()
 
@@ -187,8 +231,31 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     edges <- edges[edges$from %in% keep_ids & edges$to %in% keep_ids, , drop = FALSE]
   }
 
+  # Optional clustering: collapse disconnected components into expandable
+  # cluster nodes. Done by tagging nodes with a synthetic "cluster_N" group
+  # for components that don't contain the root, then using visClusterByGroup.
+  cluster_groups <- character(0)
+  if (isTRUE(cluster_components) && nrow(nodes) > 1 && nrow(edges) > 0) {
+    cl <- .compute_cluster_ids(nodes, edges)
+    root_cluster <- cl$nodes[match(root_id, nodes$id)]
+    # Only cluster components that don't contain the root, so the seed
+    # neighborhood stays expanded.
+    needs_cluster <- !is.na(cl$nodes) & cl$nodes != root_cluster & cl$nodes > 0
+    if (any(needs_cluster)) {
+      cluster_names <- paste0("cluster_", cl$nodes)
+      nodes$cluster_group <- ifelse(needs_cluster, cluster_names, nodes$group)
+      cluster_groups <- unique(cluster_names[needs_cluster])
+    }
+  }
+
   # Build visNetwork. Drive group styling from DOMAIN_COLORS so adding a new
   # category in one place doesn't require chasing visGroups call-by-call.
+  # When clustering is enabled, we render the cluster_group field instead so
+  # disconnected components can be collapsed by visClusterByGroup.
+  if (length(cluster_groups) > 0) {
+    nodes$group <- nodes$cluster_group
+    nodes$cluster_group <- NULL
+  }
   net <- visNetwork::visNetwork(nodes, edges, width = "100%", height = "600px")
   net <- purrr::reduce(
     names(DOMAIN_COLORS),
@@ -196,7 +263,13 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
                                    color = unname(DOMAIN_COLORS[gn])),
     .init = net
   )
-  net |>
+  # Style the synthetic cluster groups distinctly so users can see what
+  # was collapsed.
+  for (cg in cluster_groups) {
+    net <- visNetwork::visGroups(net, groupname = cg,
+                                 color = "#D6CADD", shape = "diamond")
+  }
+  net <- net |>
     visNetwork::visLegend(useGroups = TRUE, position = "right") |>
     visNetwork::visOptions(
       highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE),
@@ -210,4 +283,70 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     visNetwork::visEvents(
       selectNode = "function(nodes) { Shiny.setInputValue('dag_node_click', nodes.nodes[0], {priority: 'event'}); }"
     )
+  # Apply clustering after the base network is built.
+  for (cg in cluster_groups) {
+    net <- visNetwork::visClusteringByGroup(net, groups = cg,
+                                            label = "Disconnected: ")
+  }
+  net
+}
+
+#' Summarize what `build_dag_network` would render — used for telemetry.
+#'
+#' Replays the same node/edge assembly + MAX_RENDERED_NODES cap that
+#' build_dag_network applies, then returns counts and cluster diagnostics.
+#' Does not actually build a visNetwork object.
+summarize_dag_render <- function(dag_result, pico_elements = list()) {
+  empty <- list(n_rendered_nodes = 0L, n_rendered_edges = 0L,
+                n_clipped_by_cap = 0L, cluster_count = 0L,
+                n_unnamed_nodes = 0L, n_components_off_root = 0L,
+                has_etiology = FALSE)
+  if (is.null(dag_result) || is.null(dag_result$concept)) return(empty)
+  root_id <- dag_result$concept$cui
+
+  # Reuse the same .dag_to_nodes_edges flattener used by exports — it
+  # already applies cluster_id and rela_display, and stays in lock-step
+  # with the export schema.
+  ne <- if (exists(".dag_to_nodes_edges", mode = "function")) {
+    .dag_to_nodes_edges(dag_result)
+  } else {
+    list(nodes = tibble::tibble(id = character(0), category = character(0)),
+         edges = tibble::tibble(from = character(0), to = character(0)))
+  }
+
+  total_nodes <- nrow(ne$nodes)
+  total_edges <- nrow(ne$edges)
+  MAX_RENDERED_NODES <- 180L
+  n_clipped <- max(0L, total_nodes - MAX_RENDERED_NODES)
+  rendered_nodes <- min(total_nodes, MAX_RENDERED_NODES)
+
+  cluster_count <- if (total_nodes > 0 && "cluster_id" %in% names(ne$nodes)) {
+    length(unique(ne$nodes$cluster_id[!is.na(ne$nodes$cluster_id)]))
+  } else 0L
+
+  # Count off-root components (the "extra stars" the user sees).
+  off_root <- 0L
+  if (total_nodes > 0 && "cluster_id" %in% names(ne$nodes)) {
+    root_cluster <- ne$nodes$cluster_id[match(root_id, ne$nodes$id)]
+    if (!is.na(root_cluster)) {
+      off_root <- length(setdiff(unique(ne$nodes$cluster_id), root_cluster))
+    }
+  }
+
+  # Count nodes whose label is the "(unnamed ...)" marker — diagnostic for
+  # how often the name-resolution fallback chain runs out of options.
+  n_unnamed <- if ("label" %in% names(ne$nodes)) {
+    sum(grepl("^\\(unnamed", as.character(ne$nodes$label)))
+  } else 0L
+
+  list(
+    n_rendered_nodes      = as.integer(rendered_nodes),
+    n_rendered_edges      = as.integer(total_edges),
+    n_clipped_by_cap      = as.integer(n_clipped),
+    cluster_count         = as.integer(cluster_count),
+    n_unnamed_nodes       = as.integer(n_unnamed),
+    n_components_off_root = as.integer(off_root),
+    has_etiology          = !is.null(dag_result$etiology) &&
+                             nrow(dag_result$etiology) > 0
+  )
 }
