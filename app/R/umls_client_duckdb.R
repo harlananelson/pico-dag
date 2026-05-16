@@ -26,6 +26,27 @@ umls_db_available <- function() {
 
 # --- Name resolution (preferred + fallback chain) ---
 
+# DuckDB prepared statements can handle large IN-lists, but very long
+# string-built queries (one ? per CUI) become slow to parse. Chunk to keep
+# query strings bounded — a dense walk can produce 200-500 CUIs.
+.UMLS_IN_CHUNK <- 500L
+
+# Helper: run an IN-list query in fixed-size chunks and concatenate results.
+# `query_fmt` is sprintf with a single %s where the placeholder list goes.
+.umls_chunked_in <- function(con, query_fmt, ids, chunk = .UMLS_IN_CHUNK) {
+  ids <- unique(ids[!is.na(ids) & nzchar(ids)])
+  if (length(ids) == 0) return(NULL)
+  idx <- split(ids, ceiling(seq_along(ids) / chunk))
+  parts <- lapply(idx, function(g) {
+    ph <- paste(rep("?", length(g)), collapse = ",")
+    tryCatch(DBI::dbGetQuery(con, sprintf(query_fmt, ph), params = as.list(g)),
+             error = function(e) NULL)
+  })
+  parts <- parts[!vapply(parts, is.null, logical(1))]
+  if (length(parts) == 0) return(NULL)
+  do.call(rbind, parts)
+}
+
 #' Bulk-resolve CUIs to human-readable preferred names.
 #'
 #' Lookup chain per CUI:
@@ -46,16 +67,14 @@ umls_preferred_name <- function(cuis) {
   con <- umls_db_connect()
   if (is.null(con)) return(out)
 
-  ph <- paste(rep("?", length(uniq)), collapse = ",")
-  pref <- DBI::dbGetQuery(con, sprintf(
-    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)", ph),
-    params = as.list(uniq))
-  hit <- setNames(pref$preferred_name, pref$cui)
+  pref <- .umls_chunked_in(con,
+    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)",
+    uniq)
+  hit <- if (is.null(pref)) character(0) else setNames(pref$preferred_name, pref$cui)
 
   miss <- setdiff(uniq, names(hit))
   if (length(miss) > 0) {
-    ph2 <- paste(rep("?", length(miss)), collapse = ",")
-    fb <- DBI::dbGetQuery(con, sprintf("
+    fb <- .umls_chunked_in(con, "
       SELECT cui, str FROM (
         SELECT cui, str,
                row_number() OVER (
@@ -64,8 +83,10 @@ umls_preferred_name <- function(cuis) {
                ) rn
         FROM mrconso
         WHERE cui IN (%s) AND lat = 'ENG' AND suppress NOT IN ('O','E')
-      ) WHERE rn = 1", ph2), params = as.list(miss))
-    if (nrow(fb) > 0) hit <- c(hit, setNames(fb$str, fb$cui))
+      ) WHERE rn = 1", miss)
+    if (!is.null(fb) && nrow(fb) > 0) {
+      hit <- c(hit, setNames(fb$str, fb$cui))
+    }
   }
 
   out[names(hit)[names(hit) %in% names(out)]] <-
@@ -83,10 +104,8 @@ umls_mrsty_for_cuis <- function(cuis) {
   con <- umls_db_connect()
   if (is.null(con)) return(tibble::tibble(cui = character(0), sty = character(0)))
 
-  ph <- paste(rep("?", length(cuis)), collapse = ",")
-  res <- tryCatch(DBI::dbGetQuery(con, sprintf(
-    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", ph),
-    params = as.list(cuis)), error = function(e) NULL)
+  res <- .umls_chunked_in(con,
+    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", cuis)
   if (is.null(res) || nrow(res) == 0) {
     return(tibble::tibble(cui = character(0), sty = character(0)))
   }

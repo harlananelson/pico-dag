@@ -102,9 +102,13 @@
   n <- nrow(nodes)
   if (n == 0) return(list(nodes = integer(0), edges = integer(0)))
   if (!requireNamespace("igraph", quietly = TRUE) || nrow(edges) == 0) {
-    # Singletons each get their own cluster id when no edges connect them.
-    return(list(nodes = seq_len(n),
-                edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)))
+    # No edges (or no igraph available) → all nodes share cluster 1, since
+    # there's no connectivity information to split them on. Edges, if any,
+    # also belong to cluster 1.
+    return(list(
+      nodes = rep(1L, n),
+      edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)
+    ))
   }
   # Edges may reference from_cui values that were not materialized as nodes
   # (e.g. a click-extend that produced an edge from a concept whose only

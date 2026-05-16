@@ -158,22 +158,31 @@ display_rela <- function(rela) {
 #' regardless of which UMLS rela surfaced them. Order matters: the first match
 #' wins per CUI, so list the most specific clinical types first.
 STY_TO_CATEGORY <- list(
-  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result"),
+  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result",
+                     "Clinical Attribute"),
   procedure      = c("Therapeutic or Preventive Procedure",
                      "Diagnostic Procedure",
-                     "Health Care Activity"),
+                     "Health Care Activity",
+                     "Molecular Biology Research Technique"),
   treatment      = c("Pharmacologic Substance", "Clinical Drug",
                      "Antibiotic", "Vitamin", "Immunologic Factor",
-                     "Biologically Active Substance"),
+                     "Biologically Active Substance",
+                     "Hormone", "Enzyme", "Receptor", "Steroid",
+                     "Indicator, Reagent, or Diagnostic Aid",
+                     "Amino Acid, Peptide, or Protein"),
   anatomy        = c("Body Part, Organ, or Organ Component",
                      "Body Location or Region",
                      "Tissue", "Anatomical Structure", "Body System",
-                     "Cell", "Cell Component"),
+                     "Cell", "Cell Component",
+                     "Embryonic Structure", "Fully Formed Anatomical Structure"),
   comorbidity    = c("Disease or Syndrome", "Neoplastic Process",
                      "Mental or Behavioral Dysfunction",
                      "Pathologic Function", "Sign or Symptom",
                      "Cell or Molecular Dysfunction",
-                     "Acquired Abnormality")
+                     "Acquired Abnormality",
+                     "Congenital Abnormality",
+                     "Injury or Poisoning",
+                     "Anatomical Abnormality")
 )
 
 #' Reclassify rows of `rels` whose surfacing-rela bucket disagrees with their
@@ -582,9 +591,19 @@ combine_dags <- function(dag_a, dag_b,
   # clicked node is already in the graph and the new walk's from_cui values
   # naturally connect new edges to it.
   if (!is.null(link_rela)) {
+    # umls_get_concept returns a "(CXXX — not found)" stub when the CUI
+    # can't be resolved. That stub would land on the visible node label
+    # since clean_node_label's ^C\d+$ regex doesn't match it. Drop the
+    # stub here and let make_category_rows' last-mile resolver substitute
+    # an actual UMLS name (or the "(unnamed)" marker) instead.
+    link_name <- dag_b$concept$name
+    if (!is.null(link_name) &&
+        grepl("not found", link_name, fixed = TRUE)) {
+      link_name <- NA_character_
+    }
     link_row <- tibble::tibble(
       related_cui  = dag_b$concept$cui,
-      related_name = dag_b$concept$name,
+      related_name = link_name,
       rela         = link_rela,
       rel          = "",
       category     = link_category,
@@ -764,10 +783,15 @@ mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
                            stys  = STY_TO_CATEGORY$treatment)
   )
 
+  # Fire the fallback whenever the typed bucket is meaningfully sparse, not
+  # only when it's literally empty. One stray focus_of edge should not block
+  # the typed query from filling the bucket up to a useful size.
+  SPARSE_THRESHOLD <- 3L
+
   for (cat in names(targets)) {
     field <- targets[[cat]]$field
     current <- base[[field]]
-    if (!is.null(current) && nrow(current) > 0) next
+    if (!is.null(current) && nrow(current) >= SPARSE_THRESHOLD) next
 
     if (!is.null(progress)) {
       progress(paste0("MRSTY fallback: ", cat))
@@ -784,8 +808,14 @@ mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
         depth    = 1L,
         via      = "sty_fallback",
         from_cui = seed_cui
-      ) |>
-      dplyr::distinct(related_cui, .keep_all = TRUE)
+      )
+
+    # Dedupe on the same edge key combine_dags now uses, so a typed-fallback
+    # row whose related_cui already exists from a different from_cui doesn't
+    # collide with the existing edge.
+    dedupe_keys <- intersect(c("from_cui", "related_cui", "rela"), names(addn))
+    addn <- addn |> dplyr::distinct(dplyr::across(dplyr::all_of(dedupe_keys)),
+                                    .keep_all = TRUE)
 
     base[[field]] <- if (is.null(current) || ncol(current) == 0) {
       addn
@@ -793,7 +823,8 @@ mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
       common <- intersect(names(current), names(addn))
       dplyr::bind_rows(current[, common, drop = FALSE],
                        addn[, common, drop = FALSE]) |>
-        dplyr::distinct(related_cui, .keep_all = TRUE)
+        dplyr::distinct(dplyr::across(dplyr::all_of(
+          intersect(dedupe_keys, common))), .keep_all = TRUE)
     }
 
     if (!is.null(base$relations) && nrow(base$relations) > 0) {

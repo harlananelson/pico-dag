@@ -1,8 +1,8 @@
-# Archive created on: 2026-05-16 11:07:00
+# Archive created on: 2026-05-16 11:33:06
 
 # LLM-FRIENDLY CODE ARCHIVE
 # Generated from: /home/harlan/projects/pico-dag
-# Date: 2026-05-16 11:07:00
+# Date: 2026-05-16 11:33:06
 
 # TABLE OF CONTENTS
 1. .gitignore
@@ -23,10 +23,14 @@
 16. reviews/SUMMARY.md
 17. reviews/review_prompt.md
 18. reviews/round-1/gemini-2.5-flash.md
-19. scripts/add_mrhier_mrdef.R
-20. scripts/build_umls_db.R
-21. scripts/download_umls.sh
-22. scripts/read_events.R
+19. reviews/round-2/claude-47-opus.md
+20. reviews/round-2/gemini-2.5-pro.md
+21. reviews/round-2/gpt-5.md
+22. reviews/round-2/grok-4.md
+23. scripts/add_mrhier_mrdef.R
+24. scripts/build_umls_db.R
+25. scripts/download_umls.sh
+26. scripts/read_events.R
 
 ################################################################################
 # FILE 1: .gitignore
@@ -828,14 +832,20 @@ package_code_lists <- function(dag_result, pico_elements = list()) {
 )
 
 # Flatten dag_result to (nodes, edges) tibbles. Each node has id, label,
-# category. Each edge has from, to, rela, category. Suitable for any
-# downstream serialization.
+# category, cluster_id. Each edge has from, to, rela, rela_display, category,
+# cluster_id. Suitable for any downstream serialization.
+#
+# cluster_id is the weakly-connected component label from the rendered edge
+# set, so consumers can stratify by sub-DAG. rela_display is the user-friendly
+# label from RELA_DISPLAY; raw `rela` is kept for round-tripping.
 .dag_to_nodes_edges <- function(dag) {
   if (is.null(dag) || is.null(dag$concept)) {
     return(list(
-      nodes = tibble::tibble(id = character(0), label = character(0), category = character(0)),
+      nodes = tibble::tibble(id = character(0), label = character(0),
+                             category = character(0), cluster_id = integer(0)),
       edges = tibble::tibble(from = character(0), to = character(0),
-                             rela = character(0), category = character(0))
+                             rela = character(0), rela_display = character(0),
+                             category = character(0), cluster_id = integer(0))
     ))
   }
   root_id <- dag$concept$cui
@@ -866,9 +876,70 @@ package_code_lists <- function(dag_result, pico_elements = list()) {
 
   nodes <- purrr::list_rbind(c(list(root_node), unname(purrr::map(parts, "nodes")))) |>
     dplyr::distinct(id, .keep_all = TRUE)
-  edges <- purrr::list_rbind(unname(purrr::map(parts, "edges"))) |>
-    dplyr::distinct(from, to, rela, .keep_all = TRUE)
+  edges <- if (length(parts) > 0) {
+    purrr::list_rbind(unname(purrr::map(parts, "edges"))) |>
+      dplyr::distinct(from, to, rela, .keep_all = TRUE)
+  } else {
+    tibble::tibble(from = character(0), to = character(0),
+                   rela = character(0), category = character(0))
+  }
+
+  # rela_display column for human-readable downstream exports.
+  if (nrow(edges) > 0) {
+    edges$rela_display <- if (exists("display_rela", mode = "function")) {
+      display_rela(edges$rela)
+    } else {
+      gsub("_", " ", edges$rela)
+    }
+  } else {
+    edges$rela_display <- character(0)
+  }
+
+  # cluster_id: weakly-connected components on the rendered edge set.
+  # Used by downstream consumers to stratify by sub-DAG and by the viz to
+  # group disconnected stars under visClusterByGroup.
+  cluster_assignment <- .compute_cluster_ids(nodes, edges)
+  nodes$cluster_id <- cluster_assignment$nodes
+  edges$cluster_id <- cluster_assignment$edges
+
   list(nodes = nodes, edges = edges)
+}
+
+# Compute connected-component ids over the node/edge set. Returns
+# list(nodes = int vec aligned to nodes$id, edges = int vec aligned to edges).
+# Falls back to all-1L if igraph isn't installed.
+.compute_cluster_ids <- function(nodes, edges) {
+  n <- nrow(nodes)
+  if (n == 0) return(list(nodes = integer(0), edges = integer(0)))
+  if (!requireNamespace("igraph", quietly = TRUE) || nrow(edges) == 0) {
+    # Singletons each get their own cluster id when no edges connect them.
+    return(list(nodes = seq_len(n),
+                edges = if (nrow(edges) > 0) rep(1L, nrow(edges)) else integer(0)))
+  }
+  # Edges may reference from_cui values that were not materialized as nodes
+  # (e.g. a click-extend that produced an edge from a concept whose only
+  # other rows landed in a category that was capped out). Drop those edges
+  # for the connectivity computation but keep them in the returned data —
+  # they still belong to the cluster of their visible endpoint.
+  in_nodes <- edges$from %in% nodes$id & edges$to %in% nodes$id
+  edges_for_graph <- edges[in_nodes, c("from", "to"), drop = FALSE]
+  g <- igraph::graph_from_data_frame(
+    d        = edges_for_graph,
+    vertices = data.frame(name = nodes$id, stringsAsFactors = FALSE),
+    directed = FALSE
+  )
+  comp <- igraph::components(g)
+  node_clusters <- as.integer(comp$membership[nodes$id])
+  node_clusters[is.na(node_clusters)] <- 0L
+  # Edge cluster = the cluster of its visible endpoint. Prefer `to` since
+  # `from` may be the dropped one. Falls back to 0L when neither resolves.
+  edge_clusters <- node_clusters[match(edges$to, nodes$id)]
+  na_idx <- is.na(edge_clusters)
+  if (any(na_idx)) {
+    edge_clusters[na_idx] <- node_clusters[match(edges$from[na_idx], nodes$id)]
+  }
+  edge_clusters[is.na(edge_clusters)] <- 0L
+  list(nodes = node_clusters, edges = edge_clusters)
 }
 
 # Best-effort biolink class for a category. Used by JSON-LD export.
@@ -964,24 +1035,43 @@ export_jsonld <- function(dag) {
 }
 
 #' Export DAG as GraphML XML.
+#' Key ids are namespaced (node_* / edge_*) to keep the document
+#' well-formed — GraphML keys must be unique per attribute name within their
+#' `for` scope, and reusing the same id between node and edge keys breaks
+#' downstream parsers like yEd and Gephi.
 export_graphml <- function(dag) {
   ne <- .dag_to_nodes_edges(dag)
   esc <- .xml_escape
   node_lines <- if (nrow(ne$nodes) > 0) sprintf(
-    '    <node id="%s"><data key="label">%s</data><data key="category">%s</data></node>',
-    esc(ne$nodes$id), esc(ne$nodes$label), esc(ne$nodes$category)
+    paste0('    <node id="%s">',
+           '<data key="node_label">%s</data>',
+           '<data key="node_category">%s</data>',
+           '<data key="node_cluster">%s</data>',
+           '</node>'),
+    esc(ne$nodes$id), esc(ne$nodes$label), esc(ne$nodes$category),
+    esc(as.character(ne$nodes$cluster_id))
   ) else character(0)
   edge_lines <- if (nrow(ne$edges) > 0) sprintf(
-    '    <edge source="%s" target="%s"><data key="rela">%s</data><data key="category">%s</data></edge>',
-    esc(ne$edges$from), esc(ne$edges$to), esc(ne$edges$rela), esc(ne$edges$category)
+    paste0('    <edge source="%s" target="%s">',
+           '<data key="edge_rela">%s</data>',
+           '<data key="edge_rela_display">%s</data>',
+           '<data key="edge_category">%s</data>',
+           '<data key="edge_cluster">%s</data>',
+           '</edge>'),
+    esc(ne$edges$from), esc(ne$edges$to),
+    esc(ne$edges$rela), esc(ne$edges$rela_display),
+    esc(ne$edges$category), esc(as.character(ne$edges$cluster_id))
   ) else character(0)
   paste(c(
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
-    '  <key id="label"    for="node" attr.name="label"    attr.type="string"/>',
-    '  <key id="category" for="node" attr.name="category" attr.type="string"/>',
-    '  <key id="rela"     for="edge" attr.name="rela"     attr.type="string"/>',
-    '  <key id="category" for="edge" attr.name="category" attr.type="string"/>',
+    '  <key id="node_label"        for="node" attr.name="label"        attr.type="string"/>',
+    '  <key id="node_category"     for="node" attr.name="category"     attr.type="string"/>',
+    '  <key id="node_cluster"      for="node" attr.name="cluster_id"   attr.type="int"/>',
+    '  <key id="edge_rela"         for="edge" attr.name="rela"         attr.type="string"/>',
+    '  <key id="edge_rela_display" for="edge" attr.name="rela_display" attr.type="string"/>',
+    '  <key id="edge_category"     for="edge" attr.name="category"     attr.type="string"/>',
+    '  <key id="edge_cluster"      for="edge" attr.name="cluster_id"   attr.type="int"/>',
     sprintf('  <graph id="%s" edgedefault="directed">', esc(dag$concept$cui %||% "DAG")),
     node_lines,
     edge_lines,
@@ -1031,7 +1121,10 @@ export_mermaid <- function(dag, max_nodes = 80L) {
       sprintf('  %s["%s"]', sid(ne$nodes$id), sl(ne$nodes$label)),
     if (nrow(ne$edges) > 0)
       sprintf('  %s -->|%s| %s',
-              sid(ne$edges$from), sl(ne$edges$rela), sid(ne$edges$to))
+              sid(ne$edges$from),
+              sl(if ("rela_display" %in% names(ne$edges)) ne$edges$rela_display
+                  else ne$edges$rela),
+              sid(ne$edges$to))
   ), collapse = "\n")
 }
 
@@ -1154,16 +1247,28 @@ import_graphml <- function(path) {
                        sprintf("./data[@key='%s']", key)
     xml2::xml_text(xml2::xml_find_first(node, sel, ns = ns))
   }
+  # Read both the new namespaced keys (node_*, edge_*) and the legacy
+  # un-namespaced keys produced by older builds.
+  node_key <- function(node, name) {
+    v <- data_xpath(node, paste0("node_", name))
+    if (is.na(v) || !nzchar(v)) v <- data_xpath(node, name)
+    v
+  }
+  edge_key <- function(edge, name) {
+    v <- data_xpath(edge, paste0("edge_", name))
+    if (is.na(v) || !nzchar(v)) v <- data_xpath(edge, name)
+    v
+  }
   nodes <- tibble::tibble(
     id       = xml2::xml_attr(nx, "id"),
-    label    = vapply(nx, data_xpath, character(1), key = "label"),
-    category = vapply(nx, data_xpath, character(1), key = "category")
+    label    = vapply(nx, node_key, character(1), name = "label"),
+    category = vapply(nx, node_key, character(1), name = "category")
   )
   edges <- tibble::tibble(
     from     = xml2::xml_attr(ex, "source"),
     to       = xml2::xml_attr(ex, "target"),
-    rela     = vapply(ex, data_xpath, character(1), key = "rela"),
-    category = vapply(ex, data_xpath, character(1), key = "category")
+    rela     = vapply(ex, edge_key, character(1), name = "rela"),
+    category = vapply(ex, edge_key, character(1), name = "category")
   )
   .nodes_edges_to_dag(nodes, edges)
 }
@@ -1346,6 +1451,140 @@ REL_CATEGORIES <- c(
   "PAR" = "broader",
   "RB"  = "broader"
 )
+
+# ---------------------------------------------------------------------------
+# Human-readable RELA labels for the visNetwork edges + CSV exports
+# ---------------------------------------------------------------------------
+
+#' Map raw UMLS rela strings to user-friendly display labels.
+#' Single source of truth — used by network_viz.R for edges and by dag_export.R
+#' to add a rela_display column alongside the raw rela in CSV/GraphML exports.
+RELA_DISPLAY <- c(
+  "isa"                          = "is a kind of",
+  "inverse_isa"                  = "has subtype",
+  "may_be_treated_by"            = "may be treated by",
+  "may_treat"                    = "may treat",
+  "may_be_prevented_by"          = "may be prevented by",
+  "may_prevent"                  = "may prevent",
+  "has_causative_agent"          = "caused by",
+  "causative_agent_of"           = "causes",
+  "induced_by"                   = "induced by",
+  "clinically_associated_with"   = "associated with",
+  "co-occurs_with"               = "co-occurs with",
+  "associated_condition_of"      = "occurs with",
+  "cause_of"                     = "causes",
+  "has_finding_site"             = "occurs in",
+  "finding_site_of"              = "site of",
+  "evaluated_by"                 = "evaluated by",
+  "has_evaluation"               = "evaluates",
+  "has_associated_finding"       = "presents with",
+  "associated_finding_of"        = "finding of",
+  "finding_of"                   = "is a finding of",
+  "has_finding"                  = "has finding",
+  "diagnoses"                    = "diagnoses",
+  "diagnosed_by"                 = "diagnosed by",
+  "component_of"                 = "component of",
+  "has_component"                = "has component",
+  "focus_of"                     = "focus of procedure",
+  "has_contraindicated_drug"     = "contraindicated drug",
+  "contraindicated_with_disease" = "contraindicated with",
+  "manifestation_of"             = "manifestation of",
+  "has_interpretation"           = "interpreted by",
+  "interprets"                   = "interprets",
+  "ingredient_of"                = "ingredient of",
+  "active_ingredient_of"         = "active ingredient of",
+  "active_moiety_of"             = "active moiety of",
+  "has_tradename"                = "tradename",
+  "tradename_of"                 = "tradename of",
+  "lexical_neighbor"             = "lexically related",
+  "associated_with"              = "associated with"
+)
+
+#' Vectorized display label for a rela vector.
+#' Unknown relas are humanized (underscore→space); empty rela → "related to".
+display_rela <- function(rela) {
+  rela <- as.character(rela)
+  rela[is.na(rela)] <- ""
+  out <- unname(RELA_DISPLAY[rela])
+  needs_humanize <- is.na(out)
+  if (any(needs_humanize)) {
+    humanized <- gsub("_", " ", rela[needs_humanize])
+    out[needs_humanize] <- humanized
+  }
+  out[is.na(out) | !nzchar(out)] <- "related to"
+  out
+}
+
+# ---------------------------------------------------------------------------
+# MRSTY → category map for post-walk reclassification
+# ---------------------------------------------------------------------------
+
+#' Semantic-type groups. Used to reroute concepts to their clinical category
+#' regardless of which UMLS rela surfaced them. Order matters: the first match
+#' wins per CUI, so list the most specific clinical types first.
+STY_TO_CATEGORY <- list(
+  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result"),
+  procedure      = c("Therapeutic or Preventive Procedure",
+                     "Diagnostic Procedure",
+                     "Health Care Activity"),
+  treatment      = c("Pharmacologic Substance", "Clinical Drug",
+                     "Antibiotic", "Vitamin", "Immunologic Factor",
+                     "Biologically Active Substance"),
+  anatomy        = c("Body Part, Organ, or Organ Component",
+                     "Body Location or Region",
+                     "Tissue", "Anatomical Structure", "Body System",
+                     "Cell", "Cell Component"),
+  comorbidity    = c("Disease or Syndrome", "Neoplastic Process",
+                     "Mental or Behavioral Dysfunction",
+                     "Pathologic Function", "Sign or Symptom",
+                     "Cell or Molecular Dysfunction",
+                     "Acquired Abnormality")
+)
+
+#' Reclassify rows of `rels` whose surfacing-rela bucket disagrees with their
+#' MRSTY semantic type. A concept whose intrinsic type is "Procedure" should
+#' appear in dag$procedures regardless of whether it was reached via
+#' `focus_of`, `inverse_isa`, or any other path.
+#'
+#' Rule: only promote rows whose current category is hierarchy-derived
+#' (subtype/parent) or non-specific (other/other_rela/associated/narrower/
+#' broader). Existing clinical assignments (treatment/comorbidity etc.) are
+#' preserved — we only fill gaps, never downgrade a specific category.
+reclassify_by_sty <- function(rels) {
+  if (is.null(rels) || nrow(rels) == 0) return(rels)
+  if (!"category" %in% names(rels) || !"related_cui" %in% names(rels)) return(rels)
+
+  stys <- umls_mrsty_for_cuis(unique(rels$related_cui))
+  if (nrow(stys) == 0) return(rels)
+
+  # First-match-by-priority category per CUI
+  sty_map <- stys |>
+    dplyr::group_by(cui) |>
+    dplyr::summarize(
+      sty_category = {
+        s <- unique(sty)
+        result <- NA_character_
+        for (cat in names(STY_TO_CATEGORY)) {
+          if (any(s %in% STY_TO_CATEGORY[[cat]])) { result <- cat; break }
+        }
+        result
+      },
+      .groups = "drop"
+    )
+
+  promote_from <- c("subtype", "parent", "other", "other_rela",
+                    "associated", "narrower", "broader")
+
+  rels |>
+    dplyr::left_join(sty_map, by = c("related_cui" = "cui")) |>
+    dplyr::mutate(
+      category = dplyr::case_when(
+        !is.na(sty_category) & category %in% promote_from ~ sty_category,
+        TRUE ~ category
+      )
+    ) |>
+    dplyr::select(-sty_category)
+}
 
 # Categories whose nodes are expanded further in BFS.
 # Labs, anatomy, procedures are leaves — collecting them is useful but
@@ -1616,6 +1855,12 @@ walk_concept_dag <- function(cui, max_depth = 2L, expand_n = 8L,
                        expand_n  = expand_n,
                        progress  = progress)
 
+  # MRSTY-based reclassification: route concepts to their clinical category
+  # by semantic type, not just by surfacing rela. Fixes the procedure-tab
+  # desync where procedure-flavored concepts arrive via inverse_isa and end
+  # up in `subtypes` instead of `procedures` (user-reported Atrial Tumor bug).
+  all_rels <- reclassify_by_sty(all_rels)
+
   extract <- function(cats) {
     # Preserve column structure even when no rows match — combine_dags's
     # bind_distinct uses dplyr::distinct(related_cui, ...) which crashes
@@ -1682,7 +1927,14 @@ combine_dags <- function(dag_a, dag_b,
     a2 <- a[, common, drop = FALSE]
     b2 <- b[, common, drop = FALSE]
     bound <- dplyr::bind_rows(a2, b2)
-    if ("related_cui" %in% names(bound)) {
+    # Relationships are edges, not nodes — dedupe on (from_cui, related_cui,
+    # rela) so click-to-extend can add an edge from the clicked concept back
+    # into an existing node. Keying solely on related_cui silently dropped
+    # those edges and was a major source of disconnected star clutter.
+    if (all(c("from_cui", "related_cui", "rela") %in% names(bound))) {
+      bound <- bound |>
+        dplyr::distinct(from_cui, related_cui, rela, .keep_all = TRUE)
+    } else if ("related_cui" %in% names(bound)) {
       bound <- bound |> dplyr::distinct(related_cui, .keep_all = TRUE)
     }
     bound
@@ -1845,6 +2097,78 @@ walk_concept_dag_dense <- function(cui, max_depth = 2L, expand_n = 8L,
         related_id_url = ""
       )
       base <- expand_via(base, candidates, "parent", max_calls = 2L)
+    }
+  }
+
+  # Tier 4: MRSTY-typed direct-neighbor fallback. When the standard walk +
+  # densifier still leaves procedures or labs empty, query mrrel_bidir
+  # joined to mrsty for direct neighbors of the seed CUI whose semantic
+  # type is procedure/lab. Closes the recall gap for narrow concepts whose
+  # surfacing rela is not in RELA_CATEGORIES.
+  base <- mrsty_typed_fallback(base, cui, progress = progress)
+
+  base
+}
+
+#' MRSTY-typed direct-neighbor fallback for empty procedure / lab buckets.
+#'
+#' Used after the standard densifier when categories of interest are still
+#' empty. Adds rows to base$procedures or base$diagnostic_labs (and to
+#' base$relations) with the same column shape as the BFS output, attributed
+#' from_cui = seed_cui so build_dag_network draws edges from the root.
+mrsty_typed_fallback <- function(base, seed_cui, progress = NULL) {
+  if (is.null(base)) return(base)
+  if (!exists("umls_get_neighbors_by_sty", mode = "function")) return(base)
+
+  targets <- list(
+    procedure       = list(field = "procedures",
+                           stys  = STY_TO_CATEGORY$procedure),
+    diagnostic_lab  = list(field = "diagnostic_labs",
+                           stys  = STY_TO_CATEGORY$diagnostic_lab),
+    treatment       = list(field = "treatments",
+                           stys  = STY_TO_CATEGORY$treatment)
+  )
+
+  for (cat in names(targets)) {
+    field <- targets[[cat]]$field
+    current <- base[[field]]
+    if (!is.null(current) && nrow(current) > 0) next
+
+    if (!is.null(progress)) {
+      progress(paste0("MRSTY fallback: ", cat))
+    }
+    neigh <- tryCatch(
+      umls_get_neighbors_by_sty(seed_cui, targets[[cat]]$stys, limit = 25L),
+      error = function(e) NULL
+    )
+    if (is.null(neigh) || nrow(neigh) == 0) next
+
+    addn <- neigh |>
+      dplyr::mutate(
+        category = !!cat,
+        depth    = 1L,
+        via      = "sty_fallback",
+        from_cui = seed_cui
+      ) |>
+      dplyr::distinct(related_cui, .keep_all = TRUE)
+
+    base[[field]] <- if (is.null(current) || ncol(current) == 0) {
+      addn
+    } else {
+      common <- intersect(names(current), names(addn))
+      dplyr::bind_rows(current[, common, drop = FALSE],
+                       addn[, common, drop = FALSE]) |>
+        dplyr::distinct(related_cui, .keep_all = TRUE)
+    }
+
+    if (!is.null(base$relations) && nrow(base$relations) > 0) {
+      common <- intersect(names(base$relations), names(addn))
+      base$relations <- dplyr::bind_rows(
+        base$relations[, common, drop = FALSE],
+        addn[, common, drop = FALSE]
+      ) |> dplyr::distinct(related_cui, category, .keep_all = TRUE)
+    } else {
+      base$relations <- addn
     }
   }
   base
@@ -2169,25 +2493,39 @@ medrt_get_relations <- function(cui, refresh = FALSE) {
 
 # Domain → color mapping
 DOMAIN_COLORS <- c(
-  "population" = "#E74C3C",    # red
-  "treatment" = "#3498DB",     # blue
+  "population"     = "#E74C3C", # red
+  "treatment"      = "#3498DB", # blue
   "monitoring_lab" = "#2ECC71", # green
-  "comorbidity" = "#E67E22",   # orange
-  "procedure" = "#9B59B6",     # purple
-  "anatomy" = "#F39C12",       # yellow
-  "subtype" = "#95A5A6",       # gray
-  "parent" = "#BDC3C7",        # light gray
-  "outcome" = "#E74C3C",       # red (same as population)
-  "intervention" = "#1ABC9C",  # teal
-  "comparator" = "#16A085",    # dark teal
-  "etiology"   = "#C0392B",    # deep red
-  "other" = "#7F8C8D"          # dark gray
+  "diagnostic_lab" = "#27AE60", # darker green — distinct from monitoring
+  "comorbidity"    = "#E67E22", # orange
+  "procedure"      = "#9B59B6", # purple
+  "anatomy"        = "#F39C12", # yellow
+  "subtype"        = "#95A5A6", # gray
+  "parent"         = "#BDC3C7", # light gray
+  "outcome"        = "#E74C3C", # red (same as population)
+  "intervention"   = "#1ABC9C", # teal
+  "comparator"     = "#16A085", # dark teal
+  "etiology"       = "#C0392B", # deep red
+  "other"          = "#7F8C8D"  # dark gray
 )
 
 # Strip generic UMLS scaffolding phrases before truncating node labels.
 # Vectorized: gsub/sub/str_trunc all operate elementwise on character vectors.
-clean_node_label <- function(x, max_chars = 32) {
+# Also recovers any label that slipped through as a bare CUI (e.g. when the
+# upstream concept_preferred / mrconso fallback both miss) by substituting
+# a marker the user can recognize.
+clean_node_label <- function(x, max_chars = 32, cuis = NULL) {
   x <- ifelse(is.na(x), "", as.character(x))
+  # Recover: if a label looks like a bare CUI, replace with "(unnamed)".
+  # Resolution should happen upstream via umls_preferred_name(); this is the
+  # last-mile safety net.
+  if (!is.null(cuis)) {
+    leaked <- grepl("^C\\d+$", x) | !nzchar(x)
+    if (any(leaked)) x[leaked] <- paste0("(unnamed ", cuis[leaked], ")")
+  } else {
+    leaked <- grepl("^C\\d+$", x)
+    if (any(leaked)) x[leaked] <- "(unnamed)"
+  }
   y <- gsub("\\s+", " ", x)
   y <- sub("^Disorder characterized by\\s+", "", y, ignore.case = TRUE)
   y <- sub("^Disease or Syndrome\\s*:?\\s*", "", y, ignore.case = TRUE)
@@ -2236,24 +2574,41 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     } else {
       data$from_cui[is.na(data$from_cui) | !nzchar(data$from_cui)] <- root_id
     }
+    # Last-mile name resolution: if a row arrived here with an empty or
+    # bare-CUI name, resolve from UMLS before rendering. Eliminates the
+    # remaining bare-CUI display bug for any path the SQL fallback missed.
+    name_broken <- is.na(data$related_name) |
+                   !nzchar(data$related_name) |
+                   data$related_name == data$related_cui
+    if (any(name_broken) && exists("umls_preferred_name", mode = "function")) {
+      data$related_name[name_broken] <-
+        unname(umls_preferred_name(data$related_cui[name_broken]))
+    }
     data <- data |>
       dplyr::group_by(from_cui) |>
       dplyr::slice_head(n = max_nodes) |>
       dplyr::ungroup()
     edge_from <- data$from_cui
+    rela_disp <- if (exists("display_rela", mode = "function")) {
+      display_rela(data$rela)
+    } else {
+      data$rela
+    }
     nodes <- tibble::tibble(
       id    = data$related_cui,
-      label = clean_node_label(data$related_name),
+      label = clean_node_label(data$related_name, cuis = data$related_cui),
       group = category,
       title = paste0("<b>", data$related_name, "</b><br>CUI: ", data$related_cui,
-                     "<br>Relationship: ", data$rela),
+                     "<br>Relationship: ", rela_disp,
+                     " <span style='color:#888'>(", data$rela, ")</span>"),
       shape = "dot",
       size  = 15
     )
     edges <- tibble::tibble(
       from   = edge_from,
       to     = data$related_cui,
-      label  = data$rela,
+      label  = rela_disp,
+      title  = data$rela,                    # raw rela in hover tooltip
       arrows = "to",
       color  = DOMAIN_COLORS[category] %||% "#7F8C8D"
     )
@@ -2267,7 +2622,8 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     make_category_rows(dag_result$anatomy,         "anatomy",        max_nodes = 10),
     make_category_rows(dag_result$subtypes,        "subtype",        max_nodes = 15),
     make_category_rows(dag_result$parents,         "parent",         max_nodes =  6),
-    make_category_rows(dag_result$diagnostic_labs, "monitoring_lab", max_nodes = 15),
+    make_category_rows(dag_result$diagnostic_labs, "diagnostic_lab", max_nodes = 15),
+    make_category_rows(dag_result$monitoring_labs, "monitoring_lab", max_nodes = 15),
     if (!is.null(dag_result$etiology)) make_category_rows(dag_result$etiology, "etiology", max_nodes = 8)
     else list(nodes = NULL, edges = NULL)
   )
@@ -2322,19 +2678,16 @@ build_dag_network <- function(dag_result, pico_elements = list()) {
     edges <- edges[edges$from %in% keep_ids & edges$to %in% keep_ids, , drop = FALSE]
   }
 
-  # Build visNetwork
-  visNetwork::visNetwork(nodes, edges, width = "100%", height = "600px") |>
-    visNetwork::visGroups(groupname = "population", color = DOMAIN_COLORS["population"]) |>
-    visNetwork::visGroups(groupname = "treatment", color = DOMAIN_COLORS["treatment"]) |>
-    visNetwork::visGroups(groupname = "monitoring_lab", color = DOMAIN_COLORS["monitoring_lab"]) |>
-    visNetwork::visGroups(groupname = "comorbidity", color = DOMAIN_COLORS["comorbidity"]) |>
-    visNetwork::visGroups(groupname = "procedure", color = DOMAIN_COLORS["procedure"]) |>
-    visNetwork::visGroups(groupname = "anatomy", color = DOMAIN_COLORS["anatomy"]) |>
-    visNetwork::visGroups(groupname = "subtype", color = DOMAIN_COLORS["subtype"]) |>
-    visNetwork::visGroups(groupname = "parent", color = DOMAIN_COLORS["parent"]) |>
-    visNetwork::visGroups(groupname = "etiology", color = DOMAIN_COLORS["etiology"]) |>
-    visNetwork::visGroups(groupname = "intervention", color = DOMAIN_COLORS["intervention"]) |>
-    visNetwork::visGroups(groupname = "comparator", color = DOMAIN_COLORS["comparator"]) |>
+  # Build visNetwork. Drive group styling from DOMAIN_COLORS so adding a new
+  # category in one place doesn't require chasing visGroups call-by-call.
+  net <- visNetwork::visNetwork(nodes, edges, width = "100%", height = "600px")
+  net <- purrr::reduce(
+    names(DOMAIN_COLORS),
+    \(g, gn) visNetwork::visGroups(g, groupname = gn,
+                                   color = unname(DOMAIN_COLORS[gn])),
+    .init = net
+  )
+  net |>
     visNetwork::visLegend(useGroups = TRUE, position = "right") |>
     visNetwork::visOptions(
       highlightNearest = list(enabled = TRUE, degree = 1, hover = TRUE),
@@ -2675,6 +3028,128 @@ umls_db_available <- function() {
   !is.null(con)
 }
 
+# --- Name resolution (preferred + fallback chain) ---
+
+#' Bulk-resolve CUIs to human-readable preferred names.
+#'
+#' Lookup chain per CUI:
+#'   1. concept_preferred (canonical English PT)
+#'   2. mrconso English atom (any TTY, suppress NOT IN ('O','E'))
+#'   3. NA_character_ — caller decides what to do
+#'
+#' Returns a named character vector the same length as `cuis`, in the same
+#' order, with names = cuis. Never returns the CUI string itself; that is the
+#' bug we are explicitly closing here.
+umls_preferred_name <- function(cuis) {
+  cuis <- as.character(cuis)
+  cuis[is.na(cuis)] <- ""
+  out <- setNames(rep(NA_character_, length(cuis)), cuis)
+  uniq <- unique(cuis[nzchar(cuis)])
+  if (length(uniq) == 0) return(out)
+
+  con <- umls_db_connect()
+  if (is.null(con)) return(out)
+
+  ph <- paste(rep("?", length(uniq)), collapse = ",")
+  pref <- DBI::dbGetQuery(con, sprintf(
+    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)", ph),
+    params = as.list(uniq))
+  hit <- setNames(pref$preferred_name, pref$cui)
+
+  miss <- setdiff(uniq, names(hit))
+  if (length(miss) > 0) {
+    ph2 <- paste(rep("?", length(miss)), collapse = ",")
+    fb <- DBI::dbGetQuery(con, sprintf("
+      SELECT cui, str FROM (
+        SELECT cui, str,
+               row_number() OVER (
+                 PARTITION BY cui
+                 ORDER BY (ispref = 'Y') DESC, (ts = 'P') DESC, length(str)
+               ) rn
+        FROM mrconso
+        WHERE cui IN (%s) AND lat = 'ENG' AND suppress NOT IN ('O','E')
+      ) WHERE rn = 1", ph2), params = as.list(miss))
+    if (nrow(fb) > 0) hit <- c(hit, setNames(fb$str, fb$cui))
+  }
+
+  out[names(hit)[names(hit) %in% names(out)]] <-
+    hit[names(hit)[names(hit) %in% names(out)]]
+  out
+}
+
+#' Bulk MRSTY lookup. Returns a data frame with cui, sty (one row per pair).
+umls_mrsty_for_cuis <- function(cuis) {
+  cuis <- unique(as.character(cuis))
+  cuis <- cuis[nzchar(cuis) & !is.na(cuis)]
+  if (length(cuis) == 0) {
+    return(tibble::tibble(cui = character(0), sty = character(0)))
+  }
+  con <- umls_db_connect()
+  if (is.null(con)) return(tibble::tibble(cui = character(0), sty = character(0)))
+
+  ph <- paste(rep("?", length(cuis)), collapse = ",")
+  res <- tryCatch(DBI::dbGetQuery(con, sprintf(
+    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", ph),
+    params = as.list(cuis)), error = function(e) NULL)
+  if (is.null(res) || nrow(res) == 0) {
+    return(tibble::tibble(cui = character(0), sty = character(0)))
+  }
+  tibble::as_tibble(res)
+}
+
+#' Find UMLS neighbors of `cui` whose semantic type is in `stys`.
+#'
+#' Used by the densifier as a targeted MRSTY-typed fallback when the standard
+#' walk produces zero procedures or zero labs. Joins mrrel_bidir (relations)
+#' with mrsty (semantic type) and concept_preferred (display name).
+#'
+#' Returns a tibble shaped like umls_get_relations output: cui, related_cui,
+#' related_name, rel, rela, related_id_url.
+umls_get_neighbors_by_sty <- function(cui, stys, limit = 25L) {
+  if (length(stys) == 0) {
+    return(tibble::tibble(cui = character(0), related_cui = character(0),
+                          related_name = character(0), rel = character(0),
+                          rela = character(0), related_id_url = character(0)))
+  }
+  con <- umls_db_connect()
+  if (is.null(con)) {
+    return(tibble::tibble(cui = character(0), related_cui = character(0),
+                          related_name = character(0), rel = character(0),
+                          rela = character(0), related_id_url = character(0)))
+  }
+  ph <- paste(rep("?", length(stys)), collapse = ",")
+  res <- tryCatch(DBI::dbGetQuery(con, sprintf("
+    SELECT DISTINCT
+      r.cui1 AS cui,
+      r.cui2 AS related_cui,
+      cp.preferred_name AS related_name,
+      r.rel,
+      coalesce(r.rela, '') AS rela,
+      '' AS related_id_url
+    FROM mrrel_bidir r
+    JOIN mrsty s ON s.cui = r.cui2 AND s.sty IN (%s)
+    LEFT JOIN concept_preferred cp ON cp.cui = r.cui2
+    WHERE r.cui1 = ?
+      AND r.cui1 <> r.cui2
+    LIMIT ?", ph),
+    params = c(as.list(stys), list(cui, as.integer(limit)))),
+    error = function(e) NULL)
+  if (is.null(res) || nrow(res) == 0) {
+    return(tibble::tibble(cui = character(0), related_cui = character(0),
+                          related_name = character(0), rel = character(0),
+                          rela = character(0), related_id_url = character(0)))
+  }
+  res <- tibble::as_tibble(res)
+  # Backfill names that concept_preferred missed.
+  need <- is.na(res$related_name) | !nzchar(res$related_name) |
+          res$related_name == res$related_cui
+  if (any(need)) {
+    res$related_name[need] <- unname(umls_preferred_name(res$related_cui[need]))
+  }
+  # Drop rows that still couldn't resolve to a name.
+  res[!is.na(res$related_name) & nzchar(res$related_name), , drop = FALSE]
+}
+
 # --- Search ---
 
 #' Search UMLS for a concept by name
@@ -2757,7 +3232,7 @@ umls_get_relations <- function(cui) {
     SELECT
       r.cui1        AS cui,
       r.cui2        AS related_cui,
-      coalesce(cp.preferred_name, r.cui2) AS related_name,
+      cp.preferred_name AS related_name,
       r.rel,
       coalesce(r.rela, '') AS rela,
       ''            AS related_id_url
@@ -2770,6 +3245,17 @@ umls_get_relations <- function(cui) {
       !rela %in% c("translation_of", "has_translation"),
       nchar(related_cui) > 0
     )
+
+  # Backfill names that concept_preferred missed (mrconso English-atom fallback).
+  # Without this, related_name comes back NA and downstream code falls back to
+  # the CUI string, leaking bare CUIs onto graph node labels.
+  need_name <- is.na(bidir$related_name) | !nzchar(bidir$related_name)
+  if (any(need_name)) {
+    bidir$related_name[need_name] <- unname(
+      umls_preferred_name(bidir$related_cui[need_name])
+    )
+  }
+  bidir <- bidir |> dplyr::filter(!is.na(related_name), nzchar(related_name))
 
   # Layer 1b: MRHIER hierarchy edges — supplements MRREL's hierarchical
   # relations with paths that are encoded only in MRHIER (path-to-root view).
@@ -3889,13 +4375,27 @@ server <- function(input, output, session) {
         lines <- c(lines, "", "# Monitoring Labs", "",
                     "| Lab | Monitors | CUI |",
                     "|-----|----------|-----|")
+        # Derive the monitored drug from from_cui via the broader relations
+        # table (the lab row stores from_cui = the drug that surfaced it).
+        # The previous code referenced a `parent_drug_name` column that
+        # never existed and crashed the download.
+        drug_lookup <- if (!is.null(rv$dag_result$relations) &&
+                            nrow(rv$dag_result$relations) > 0) {
+          rv$dag_result$relations |>
+            dplyr::distinct(related_cui, related_name) |>
+            dplyr::rename(from_cui = related_cui, drug_name = related_name)
+        } else {
+          tibble::tibble(from_cui = character(0), drug_name = character(0))
+        }
         unique_labs <- monitoring |>
+          dplyr::left_join(drug_lookup, by = "from_cui") |>
           dplyr::distinct(related_cui, .keep_all = TRUE) |>
           utils::head(30)
+        unique_labs$drug_name[is.na(unique_labs$drug_name)] <- "—"
         for (i in seq_len(nrow(unique_labs))) {
           lines <- c(lines, paste0(
             "| ", unique_labs$related_name[i],
-            " | ", unique_labs$parent_drug_name[i],
+            " | ", unique_labs$drug_name[i],
             " | ", unique_labs$related_cui[i], " |"
           ))
         }
@@ -4212,7 +4712,1014 @@ Overall, this is a very high-quality piece of code. The suggestions are primaril
 [3] Wickham, H. (2023). *httr2: Perform HTTP Requests and Process Responses*. R package version 1.0.0. Retrieved from [https://httr2.r-lib.org/](https://httr2.r-lib.org/)
 
 ################################################################################
-# FILE 19: scripts/add_mrhier_mrdef.R
+# FILE 19: reviews/round-2/claude-47-opus.md
+################################################################################
+
+
+
+# pico-dag review
+
+## Critical Issues (P1)
+
+### 1. CUI leaks into visible labels via missing/empty `related_name`
+**Severity:** High. **Files:** `app/R/network_viz.R` (`build_dag_network` / `make_category_rows`), `app/R/umls_client_duckdb.R` (`umls_get_relations`), `app/R/dag_walker.R` (`extend_concept_dag`, `combine_dags`).
+
+**Root cause:** Multiple paths set `related_name` to a value that can be `NA`, `""`, or a CUI string:
+
+- `umls_get_relations` (DuckDB layer 1):
+  ```r
+  coalesce(cp.preferred_name, r.cui2) AS related_name
+  ```
+  When the related concept has no `concept_preferred` row (CHV, OMIM, NCI-only atoms; or any CUI inserted in `mrconso` whose strict `ts='P' AND tty='PT' AND lat='ENG'` rule failed), the CUI string is written into `related_name` and ends up on the node. This is the dominant source of the bug.
+
+- `hier` block: `related_name = unname(name_lookup[hier$cui2])` then `filter(!is.na(related_name))` — so `NA` rows are dropped, but the bidir path above is not filtered, so the CUI version leaks through.
+
+- `medrt_compat` uses `drugs$name` straight from RxNav — fine for drugs, but never reconciled against `concept_preferred`.
+
+- `clean_node_label("")` returns `""`, and visNetwork falls back to the node id (the CUI) when the label is empty.
+
+- `extend_concept_dag` resets `from_cui` but never rewrites `related_name` for the link row, and in the click case the clicked node id may be a source-vocab id never present in `concept_preferred`.
+
+**Fix:** One central resolver + a hard guarantee in the viz builder. Add to `umls_client_duckdb.R`:
+
+```r
+#' Resolve a vector of CUIs to preferred names, with UMLS fallback chain.
+#' Never returns NA or the CUI string — always a human-readable label.
+umls_resolve_names <- function(cuis) {
+  cuis <- as.character(cuis); cuis[is.na(cuis)] <- ""
+  uniq <- unique(cuis[nzchar(cuis)])
+  if (length(uniq) == 0) return(setNames(character(0), character(0)))
+  con <- umls_db_connect()
+  out <- setNames(rep(NA_character_, length(uniq)), uniq)
+  if (!is.null(con)) {
+    ph <- paste(rep("?", length(uniq)), collapse = ",")
+    r <- DBI::dbGetQuery(con, sprintf(
+      "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)", ph),
+      params = as.list(uniq))
+    out[r$cui] <- r$preferred_name
+    miss <- uniq[is.na(out[uniq])]
+    if (length(miss) > 0) {
+      ph2 <- paste(rep("?", length(miss)), collapse = ",")
+      # Fallback: shortest English string with non-suppressed status
+      r2 <- DBI::dbGetQuery(con, sprintf(
+        "SELECT cui, str FROM (
+           SELECT cui, str,
+             row_number() OVER (PARTITION BY cui ORDER BY length(str)) rn
+           FROM mrconso
+           WHERE cui IN (%s) AND lat = 'ENG' AND suppress NOT IN ('O','E')
+         ) WHERE rn = 1", ph2), params = as.list(miss))
+      out[r2$cui] <- r2$str
+    }
+  }
+  # Final fallback: the CUI itself with a marker so reviewers spot it
+  out[is.na(out)] <- paste0("(", names(out)[is.na(out)], ")")
+  out[cuis]
+}
+```
+
+Then in `network_viz.R::make_category_rows`, replace `clean_node_label(data$related_name)` with a resolver call when the name is empty/equals the CUI:
+
+```r
+needs_fix <- !nzchar(data$related_name) | data$related_name == data$related_cui
+if (any(needs_fix)) {
+  resolved <- umls_resolve_names(data$related_cui[needs_fix])
+  data$related_name[needs_fix] <- resolved
+}
+```
+
+Also: fix the DuckDB query to stop emitting CUIs as names — change `COALESCE(cp.preferred_name, r.cui2)` to `COALESCE(cp.preferred_name, NULL)` and do the resolver fallback in R, where you have the full chain (mrconso shortest, RxNav cached name, etc.).
+
+---
+
+### 2. Edge labels show raw UMLS relas (`isa`, `inverse_isa`, `may_be_treated_by`)
+**Severity:** High. **Files:** `app/R/network_viz.R` (edge `label = data$rela`), `app/R/dag_export.R` (edges.csv exports `rela` as-is), Mermaid/GraphML/JSON-LD exports.
+
+**Root cause:** No display-label mapping exists. `make_category_rows` does `label = data$rela`.
+
+**Fix:** One lookup table, applied in viz + exports. Add to `dag_walker.R` (next to `RELA_CATEGORIES`):
+
+```r
+RELA_DISPLAY <- c(
+  "isa"                          = "is a kind of",
+  "inverse_isa"                  = "has subtype",
+  "may_be_treated_by"            = "may be treated by",
+  "may_treat"                    = "may treat",
+  "may_be_prevented_by"          = "may be prevented by",
+  "may_prevent"                  = "may prevent",
+  "has_causative_agent"          = "caused by",
+  "causative_agent_of"           = "causes",
+  "clinically_associated_with"   = "associated with",
+  "co-occurs_with"               = "co-occurs with",
+  "has_finding_site"             = "occurs in",
+  "finding_site_of"              = "site of",
+  "evaluated_by"                 = "evaluated by",
+  "has_evaluation"               = "evaluates",
+  "has_associated_finding"       = "presents with",
+  "finding_of"                   = "is a finding of",
+  "diagnoses"                    = "diagnoses",
+  "diagnosed_by"                 = "diagnosed by",
+  "component_of"                 = "component of",
+  "has_component"                = "has component",
+  "focus_of"                     = "focus of procedure",
+  "has_contraindicated_drug"     = "contraindicated drug",
+  "contraindicated_with_disease" = "contraindicated with",
+  "induced_by"                   = "induced by",
+  "manifestation_of"             = "manifestation of",
+  "has_interpretation"           = "interpreted by",
+  "interprets"                   = "interprets",
+  "lexical_neighbor"             = "lexically related"
+)
+
+display_rela <- function(rela) {
+  out <- unname(RELA_DISPLAY[rela])
+  empty <- is.na(out) | !nzchar(out)
+  # Humanize unknown relas: replace _ with space
+  out[empty] <- gsub("_", " ", rela[empty])
+  out[is.na(out) | !nzchar(out)] <- "related to"
+  out
+}
+```
+
+Use `display_rela(data$rela)` for the visNetwork edge `label`, and in `dag_export.R` add a `rela_display` column to edges.csv alongside `rela` (keep `rela` for machine round-tripping).
+
+---
+
+### 3. Procedures-tab/graph desync (Atrial Tumor C0741300)
+**Severity:** High. **Files:** `app/R/dag_walker.R` (`RELA_CATEGORIES`, `walk_concept_dag`, `walk_concept_dag_dense`), `app/R/network_viz.R`.
+
+**Root cause (confirmed by reading the routing logic):**
+
+"Transplant of Heart" and "Operative Procedure on Corona[ry artery]" reach the graph through one of two paths:
+
+1. **Densifier subtype/parent walk.** `walk_concept_dag_dense` walks parents (Tier 1, up to 4) and subtypes (Tier 2, up to 2). Each merged sub-walk's procedure-flavored neighbors arrive labelled with whatever `rela` connected them — and `inverse_isa` / `isa` route them to `subtypes` / `parents` per `RELA_CATEGORIES`, **not** `procedures`. So a procedure CUI reachable as a sibling under a parent like "Cardiac Procedure" lands in `subtypes` (rela=`inverse_isa`), then renders via `make_category_rows(dag$subtypes, ...)` and shows up on the graph.
+
+2. **`focus_of` is the only mapping to `procedure`.** That's an extremely narrow door — most procedure CUIs are reached via hierarchy (`isa`/`inverse_isa`) or `method_of`/`procedure_site_of`/`direct_procedure_site_of` etc., none of which are in `RELA_CATEGORIES`.
+
+The Procedures tab reads only `dag_result$procedures`, so it's empty even though the procedure node is visible.
+
+**Fix:** Classify by MRSTY semantic type after the walk, not solely by source rela. Add a post-walk reclassifier:
+
+```r
+# In dag_walker.R, after walk_concept_dag builds `all_rels`:
+
+# Semantic-type groups → category (one CUI can have multiple TUIs; first match wins)
+STY_TO_CATEGORY <- list(
+  procedure = c("Therapeutic or Preventive Procedure",
+                "Diagnostic Procedure", "Health Care Activity"),
+  diagnostic_lab = c("Laboratory Procedure", "Laboratory or Test Result"),
+  treatment = c("Pharmacologic Substance", "Clinical Drug",
+                "Antibiotic", "Vitamin", "Immunologic Factor"),
+  anatomy = c("Body Part, Organ, or Organ Component", "Body Location or Region",
+              "Tissue", "Anatomical Structure", "Body System"),
+  comorbidity = c("Disease or Syndrome", "Neoplastic Process",
+                  "Mental or Behavioral Dysfunction", "Sign or Symptom",
+                  "Pathologic Function")
+)
+
+reclassify_by_sty <- function(rels) {
+  if (nrow(rels) == 0) return(rels)
+  con <- umls_db_connect()
+  if (is.null(con)) return(rels)
+  uniq <- unique(rels$related_cui)
+  ph <- paste(rep("?", length(uniq)), collapse = ",")
+  sty <- DBI::dbGetQuery(con, sprintf(
+    "SELECT cui, sty FROM mrsty WHERE cui IN (%s)", ph),
+    params = as.list(uniq))
+  # First STY-derived category for each CUI
+  classify <- function(cui_stys) {
+    for (cat in names(STY_TO_CATEGORY)) {
+      if (any(cui_stys %in% STY_TO_CATEGORY[[cat]])) return(cat)
+    }
+    NA_character_
+  }
+  sty_cat <- sty |>
+    dplyr::group_by(cui) |>
+    dplyr::summarise(sty_cat = classify(sty), .groups = "drop")
+  rels |>
+    dplyr::left_join(sty_cat, by = c("related_cui" = "cui")) |>
+    dplyr::mutate(
+      # Promote to STY category when the rela-derived category is hierarchy/other
+      # but the STY says it's a clinical thing. Don't downgrade treatments etc.
+      category = dplyr::case_when(
+        !is.na(sty_cat) & category %in% c("subtype", "parent", "other",
+                                          "other_rela", "associated") ~ sty_cat,
+        TRUE ~ category
+      )
+    ) |>
+    dplyr::select(-sty_cat)
+}
+```
+
+Call `all_rels <- reclassify_by_sty(all_rels)` in `walk_concept_dag` before the `extract(...)` block. Procedure CUIs reached via `inverse_isa` will now correctly populate `dag$procedures`.
+
+---
+
+### 4. `monitoring_labs_table` will crash on `parent_drug_name` reference / silent table failure
+**Severity:** Medium-High. **Files:** `app/app.R` lines in `download_pull_request` content function and `monitoring_labs_table`.
+
+**Root cause:** In `download_pull_request`:
+```r
+unique_labs$parent_drug_name[i]
+```
+There is no `parent_drug_name` column anywhere in the walker output. The download will error out (caught by Shiny but the file will be malformed/missing the column). Separately, the `monitoring_labs_table` was patched to derive `drug_name` via a join — good — but if `from_cui` is missing (early walk paths set it to root), the "Monitors Drug" column will show the root condition name, which is wrong.
+
+**Fix:** Remove the `parent_drug_name` reference and derive it the same way the table does:
+
+```r
+drug_lookup <- rv$dag_result$relations |>
+  dplyr::distinct(related_cui, related_name) |>
+  dplyr::rename(from_cui = related_cui, drug_name = related_name)
+unique_labs <- monitoring |>
+  dplyr::left_join(drug_lookup, by = "from_cui") |>
+  dplyr::distinct(related_cui, .keep_all = TRUE) |>
+  utils::head(30)
+# then: ", unique_labs$drug_name[i], "
+```
+
+---
+
+### 5. `umls_search` is defined twice — REST version always wins
+**Severity:** Medium. **Files:** `app/R/umls_client.R` (line: `umls_search <- function(...)`) and `app/R/umls_client_duckdb.R` (line: `umls_search <- function(...)`).
+
+**Root cause:** `app/app.R` sources `umls_client_duckdb.R` (which defines `umls_search` as DuckDB-first) but **does not** source `umls_client.R`. Good. But `code_lists.R` references `umls_get_source_codes`, `umls_get_relations`, `umls_get_concept` — all also redefined. The duckdb file re-defines REST fallbacks under `_rest` suffix, so it's fine — except `umls_client.R` is still in the repo and could be sourced by tests or future contributors and shadow the DB-first versions silently. The `generate_icd10_codes` function in `code_lists.R` calls `umls_get_relations` directly, which is fine, but it also calls `Sys.sleep(0.25)` between every child — that's appropriate for REST but wasted latency for DuckDB.
+
+**Fix:** Either delete `app/R/umls_client.R` outright (it's now superseded) or rename its functions to the `_rest` suffix used in `umls_client_duckdb.R` and have it sourced first as a pure REST fallback module. I'd delete it; the REST shims already live in `umls_client_duckdb.R`. Also gate the `Sys.sleep(0.25)` in `generate_icd10_codes` on `!umls_db_available()`.
+
+---
+
+### 6. `extend_concept_dag` discards relations whose `related_cui` is already visited
+**Severity:** Medium. **Files:** `app/R/dag_walker.R` (`bfs_walk`'s `distinct(related_cui, category, .keep_all = TRUE)` at the tail).
+
+**Root cause:** When a user clicks a node to extend, the new walk's `bfs_walk` ends with:
+```r
+dplyr::distinct(related_cui, category, .keep_all = TRUE)
+```
+keyed only on `(related_cui, category)`. The shallowest-path-wins comment is correct for an isolated walk, but in `combine_dags` the `bind_distinct` for each category does:
+```r
+bound |> dplyr::distinct(related_cui, .keep_all = TRUE)
+```
+which drops any new edge whose `related_cui` already exists in the prior DAG. That means clicking node B never produces an edge from B to an existing node — the relationship is silently dropped, leaving an unconnected star. This is one of the root causes of issue #4 (star clutter).
+
+**Fix:** Key the distinct on `(from_cui, related_cui, rela)` — relationships are edges, not nodes:
+
+```r
+# bind_distinct in combine_dags:
+if (all(c("from_cui","related_cui","rela") %in% names(bound))) {
+  bound <- bound |> dplyr::distinct(from_cui, related_cui, rela, .keep_all = TRUE)
+} else if ("related_cui" %in% names(bound)) {
+  bound <- bound |> dplyr::distinct(related_cui, .keep_all = TRUE)
+}
+```
+
+Same fix in `bfs_walk`'s tail distinct.
+
+---
+
+### 7. CSV exports lack `cluster_id` and `rela_display`
+**Severity:** Medium. **Files:** `app/R/dag_export.R` (`.dag_to_nodes_edges`).
+
+**Fix:** Add cluster computation and display label:
+
+```r
+.dag_to_nodes_edges <- function(dag) {
+  # ... existing code that produces nodes, edges ...
+
+  # Cluster id by weakly-connected components of the rendered edge set
+  if (nrow(edges) > 0 && requireNamespace("igraph", quietly = TRUE)) {
+    g <- igraph::graph_from_data_frame(
+      edges |> dplyr::select(from, to),
+      vertices = nodes |> dplyr::select(id),
+      directed = FALSE
+    )
+    comp <- igraph::components(g)
+    nodes$cluster_id <- unname(comp$membership[nodes$id])
+    # Edge cluster = its endpoint cluster (always equal for connected components)
+    edge_cluster <- nodes$cluster_id[match(edges$from, nodes$id)]
+    edges$cluster_id <- edge_cluster
+  } else {
+    nodes$cluster_id <- 1L
+    edges$cluster_id <- 1L
+  }
+
+  if ("rela" %in% names(edges)) edges$rela_display <- display_rela(edges$rela)
+
+  list(nodes = nodes, edges = edges)
+}
+```
+
+Also worth: write a small `attestation.json` alongside the CSV bundle with the seed CUI, walk depth, expand_n, UMLS release version, RxNav cache timestamp, and a generation timestamp — answers the "missing column attestation in exports" concern.
+
+---
+
+### 8. Sparse lab/procedure recall — no MRSTY-typed fallback
+**Severity:** Medium. **Files:** `app/R/dag_walker.R` (`walk_concept_dag_dense`).
+
+**Root cause:** `walk_concept_dag_dense` densifies via parents → subtypes → lexical neighbors. None of these specifically targets missing labs or missing procedures. For seeds that have neither `evaluated_by` nor `has_associated_finding` rows in MRREL (common for narrow OMIM/CHV terms), labs stay at zero even though MRREL has neighbor concepts at semantic type 'Laboratory Procedure' one hop away.
+
+**Fix:** Add a tier-4 typed-neighbor query keyed on MRSTY:
+
+```r
+# In dag_walker.R, end of walk_concept_dag_dense, before return:
+
+if (nrow(base$diagnostic_labs) == 0 || nrow(base$procedures) == 0) {
+  con <- umls_db_connect()
+  if (!is.null(con)) {
+    target_stys <- list(
+      diagnostic_lab = c("Laboratory Procedure", "Diagnostic Procedure"),
+      procedure      = c("Therapeutic or Preventive Procedure", "Health Care Activity")
+    )
+    for (cat in names(target_stys)) {
+      if (nrow(base[[paste0(cat, "s")]] %||% base[[cat]] %||% tibble::tibble()) > 0) next
+      stys <- target_stys[[cat]]
+      ph <- paste(rep("?", length(stys)), collapse = ",")
+      neighbors <- DBI::dbGetQuery(con, sprintf("
+        SELECT DISTINCT r.cui2 AS related_cui, cp.preferred_name AS related_name,
+                        r.rel, r.rela
+        FROM mrrel_bidir r
+        JOIN mrsty s ON s.cui = r.cui2 AND s.sty IN (%s)
+        LEFT JOIN concept_preferred cp ON cp.cui = r.cui2
+        WHERE r.cui1 = ? LIMIT 25", ph),
+        params = c(as.list(stys), list(cui)))
+      if (nrow(neighbors) > 0) {
+        neighbors <- neighbors |>
+          dplyr::mutate(category = !!cat, depth = 1L, via = "sty_fallback",
+                        from_cui = cui, related_id_url = "")
+        target_field <- if (cat == "diagnostic_lab") "diagnostic_labs" else "procedures"
+        base[[target_field]] <- dplyr::bind_rows(base[[target_field]], neighbors)
+        base$relations <- dplyr::bind_rows(base$relations, neighbors)
+      }
+    }
+  }
+}
+```
+
+The same pattern can fill `treatments` when empty (add `Pharmacologic Substance`, `Clinical Drug` to the map).
+
+---
+
+## Architectural Concerns (P0)
+
+### A. Category routing should be MRSTY-first, not rela-first
+The current design treats `RELA_CATEGORIES` as the source of truth and uses MRSTY only at concept-detail time. This is backwards for clinical filtering:
+
+- A "Procedure" is a procedure no matter which rela got you there.
+- A "Drug" is a treatment whether you arrived via `may_be_treated_by` or `inverse_isa` from a drug class.
+
+The fix in P1 #3 is a tactical patch. The strategic move is to make MRSTY-derived category the **primary** label and treat rela as **secondary attribution** ("how we found it"). This collapses several of the listed bugs (3, 4 partially, 6 partially) into one design change.
+
+**Decision needed from a human:** Are you OK with a CUI appearing in *two* category tables when its semantic types span both (e.g., "Cardiac transplant" as both `Procedure` and `Therapeutic Procedure`)? My recommendation: one CUI → one primary category by priority order (treatment > procedure > diagnostic_lab > comorbidity > anatomy > subtype > parent > other), so the category tabs partition the node set.
+
+### B. Visible-graph filter independent of walker
+Issue 4 (star clutter) is really two problems: too many peripheral nodes, and disconnected stars. Both are *rendering* problems, not walker problems. Recommend keeping the walker greedy (it's already capped) but adding a `viz_filter` step in `network_viz.R` before building visNetwork:
+
+1. Filter nodes to clinical STYs (Disease, Procedure, Lab, Drug, Sign/Symptom, Anatomy).
+2. Compute `igraph::components()` on the rendered edges.
+3. Drop components of size ≤ 2 unless they include the root.
+4. Use `visNetwork::visClusterByGroup` on the remaining components by `cluster_id`.
+
+This is the same `cluster_id` you'd add to CSV exports — compute once, use twice.
+
+### C. `Sys.sleep` in BFS while DuckDB is the backend
+`bfs_walk` does `Sys.sleep(0.15)` after every node. That sleep is correct for the REST fallback but pure latency cost when DuckDB is available (which is the production path on `/srv/umls/umls.duckdb`). Gate it on `umls_db_available()`. For a 30-node walk this saves ~5 seconds per build.
+
+### D. `medrt_get_relations` blocking call inside `umls_get_relations`
+Every DuckDB `umls_get_relations(cui)` call invokes `medrt_get_relations(cui)`, which on a cache miss makes 4 HTTP calls to RxNav (one per `.MEDRT_RELAS` rela). During BFS that's 4 calls per node — a 20-node walk on a previously-unseen seed makes ~80 HTTP calls inside what looks like a local DB query. The sentinel handles "no MeSH code → don't ask again", but the **first** walk on a seed is dramatically slower than subsequent ones, and there's no user feedback that this is happening.
+
+**Recommend:** Either (a) batch-prefetch MED-RT for the seed and its top-N most-connected hops only, or (b) make MED-RT lookups async (future package) and merge results in a second pass, or (c) at minimum, surface "Fetching drug relations from RxNav (one-time, ~30s)" in the progress callback.
+
+### E. `.umls_con` global, single-shared DuckDB connection across Shiny sessions
+```r
+assign(".umls_con", con, envir = .GlobalEnv)
+```
+This is a single global connection shared by all Shiny sessions. DuckDB R driver isn't guaranteed thread-safe across concurrent queries on the same connection. For multi-user deployment, recommend per-session connections (using `session$userData`) or `pool::dbPool`. Low-impact at low user counts; will bite at scale.
+
+### F. Telemetry never records the visible graph
+`dag_build` logs counts of treatments/comorbidities/procedures/diagnostic_labs/parents, but not which CUIs ended up visible vs. dropped by the `MAX_RENDERED_NODES=180` cap, and never logs the cap firing. You can't reproduce a user's "the graph looked weird" report without that.
+
+**Recommend:** Add `n_rendered_nodes`, `n_rendered_edges`, `n_clipped_by_cap`, and (if present) `cluster_count` to the `dag_build` event.
+
+### G. PHI/security: search terms are logged by default
+The Incognito checkbox is good UX, but the **default** is "log everything", including raw `term`, top_cui, and top_name. If a clinician searches for a patient-identifying string (rare but happens — "John Doe pulmonary embolism"), it lands in `logs/events/*.json` in clear text. Recommend either (a) defaulting Incognito to ON for a clinical environment, or (b) hashing free-text `term` the same way you hash session IDs, with a short opt-in window for usability research. At minimum, document this in the privacy notice next to the checkbox.
+
+---
+
+## Style/Lint (P2)
+
+- **`dag_walker.R::extract`** in `walk_concept_dag` was patched to preserve column structure, but `.empty_relations_tibble()` already exists and is the canonical empty form. Use it: `if (nrow(all_rels) == 0) return(list(... = .empty_relations_tibble(), ...))` and skip the manual `filter()` dance.
+- **`dag_export.R::.dag_to_nodes_edges`** silently substitutes `root_id` for missing `from_cui`. Log a warning when this fires — it usually means a walker change broke `from_cui` propagation upstream.
+- **`network_viz.R`** keeps a hand-maintained list of `visGroups()` calls. Drive it from `DOMAIN_COLORS` directly: `purrr::reduce(names(DOMAIN_COLORS), \(net, g) visNetwork::visGroups(net, groupname = g, color = DOMAIN_COLORS[[g]]), .init = net)`.
+- **`dag_walker.R::BFS_EXPAND_CATEGORIES`** includes `"associated"` but `RELA_CATEGORIES` only maps two relas to `associated`. Likely overexpansion vector — recommend dropping it from the expand set.
+- **`medrt_rxnav.R`** `.MEDRT_CACHE_PATH` and the read-only/write reconnect pattern open and close the DuckDB on every lookup. For a hot path, a single long-lived `read_only=TRUE` connection mirroring the UMLS pattern would be cheaper.
+- **`telemetry.R`** writes one file per event. On a busy day with thousands of events the `events/` directory becomes slow to `list.files()`. Add a daily roll-up script that concatenates `events/YYYY-MM-DD/*.json` into one NDJSON file and removes the originals.
+- **`code_lists.R::generate_loinc_codes`** still calls `.loinc_class_number` with a `Sys.sleep(0.1)` per code — but the DuckDB override is now O(1). Drop the sleep when DB-backed.
+- **`app.R`** sources files with bare `source("R/...")` paths, depending on the working directory. Use `source(file.path("R", "..."))` after `setwd(getSrcDirectory(function() {}))` or move to a package layout. Currently works because `shiny::runApp("app")` sets the wd, but it's a foot-gun for `Rscript` invocations.
+- **`dag_walker.R::categorize_relations`** uses `dplyr::case_when` with `RELA_CATEGORIES[rela]` — a named-vector lookup inside `case_when` returns a vector that may not align with row order in edge cases. Safer: `categories <- coalesce(unname(RELA_CATEGORIES[rela]), unname(REL_CATEGORIES[rel]), if_else(nchar(rela) > 0, "other_rela", "other"))`.
+
+---
+
+## What I'd do first
+
+1. **Fix #6 (edge-key distinct in `combine_dags`).** Two-line change, unblocks click-to-extend showing edges back into the existing graph, and reduces star clutter for free. Highest impact-to-effort.
+2. **Add `umls_resolve_names()` and call it from `make_category_rows` whenever `related_name` is empty or equals the CUI (#1).** Kills the visible-label bug everywhere in one shot.
+3. **Add the `RELA_DISPLAY` table and `display_rela()`, wire into viz + CSV exports (#2).** ~30 lines, instant UX improvement, also makes the GraphML/Mermaid exports readable.
+4. **Add `reclassify_by_sty()` post-walk (#3).** Fixes the procedures-tab desync and primes the architectural shift to STY-first categorization. One join, ~25 lines.
+5. **Add `cluster_id` (via `igraph::components()`) to both the CSV exports and the visNetwork builder (#7 + Architectural B).** Same computation, dual benefit: stratifiable exports plus `visClusterByGroup` for the star-clutter problem.
+
+Everything else (MED-RT prefetch redesign, per-session DB connections, telemetry coverage, privacy default) is real work but not on the critical path for the user-reported bugs.
+
+################################################################################
+# FILE 20: reviews/round-2/gemini-2.5-pro.md
+################################################################################
+
+
+
+Of course, Harlan. I've reviewed the `pico-dag` application code against your specific issues and general quality criteria. This is a very well-structured and robust application, and my recommendations are designed to build upon its strong foundation. Here is my detailed review.
+
+## Critical Issues (P1)
+
+### 1. Unresolved CUI Labels in Graph and Exports
+**Severity:** High (UI/Data Integrity)
+**Files:** `app/R/umls_client_duckdb.R`, `app/R/dag_export.R`, `app/R/network_viz.R`
+
+**Root Cause:**
+There are several places where a name lookup can fail, causing a fallback to the raw CUI.
+1.  In `app/R/umls_client_duckdb.R`, the `umls_get_relations` function uses `coalesce(cp.preferred_name, r.cui2) AS related_name`. If a CUI has no entry in the `concept_preferred` table, this query correctly returns the CUI as the `related_name`. This is the primary source of the leak.
+2.  In `app/R/dag_export.R`, the `.dag_to_nodes_edges` function creates the root node with `label = dag$concept$name %||% root_id`. If `dag$concept$name` is null or empty, it falls back to the CUI.
+3.  In `app/R/network_viz.R`, the `clean_node_label` function receives an already-resolved (or failed-to-resolve) name. If it receives a CUI, it just truncates it.
+
+**Recommended Fix:**
+Modify the primary name lookup in `umls_client_duckdb.R` to implement a more robust fallback strategy. Instead of defaulting to the CUI, perform a second lookup against the main `mrconso` table. This ensures that *some* human-readable name is found, even if it's not the canonical preferred one.
+
+```r
+# Suggested patch for app/R/umls_client_duckdb.R, inside umls_get_relations()
+
+# --- Current Code ---
+# bidir <- DBI::dbGetQuery(con, "
+#   SELECT
+#     r.cui1        AS cui,
+#     r.cui2        AS related_cui,
+#     coalesce(cp.preferred_name, r.cui2) AS related_name,
+#     ...
+#   FROM mrrel_bidir r
+#   LEFT JOIN concept_preferred cp ON cp.cui = r.cui2
+#   WHERE r.cui1 = ?
+# ", params = list(cui))
+
+# --- Recommended Fix ---
+# This change introduces a second-level fallback to mrconso if concept_preferred fails.
+bidir <- DBI::dbGetQuery(con, "
+  SELECT
+    r.cui1        AS cui,
+    r.cui2        AS related_cui,
+    coalesce(
+      cp.preferred_name,
+      (SELECT str FROM mrconso mc WHERE mc.cui = r.cui2 AND mc.lat = 'ENG' ORDER BY mc.ispref = 'Y' DESC, mc.ts = 'P' DESC LIMIT 1),
+      r.cui2
+    ) AS related_name,
+    r.rel,
+    coalesce(r.rela, '') AS rela,
+    ''            AS related_id_url
+  FROM mrrel_bidir r
+  LEFT JOIN concept_preferred cp ON cp.cui = r.cui2
+  WHERE r.cui1 = ?
+", params = list(cui)) |>
+  tibble::as_tibble() |>
+  # ... rest of function
+```
+
+### 2. Procedures-Tab/Graph Desync for "Atrial Tumor" (C0741300)
+**Severity:** High (Logic/Data Integrity)
+**Files:** `app/R/dag_walker.R`
+
+**Root Cause:**
+Your hypothesis is correct. The issue stems from `categorize_relations` in `dag_walker.R`. This function assigns a category based *only* on the `rela` (relationship label) of the edge that discovered a node.
+
+For "Atrial Tumor" (C0741300), concepts like "Transplant of Heart" (C0018821) are often related via hierarchical relations like `isa` or `inverse_isa`. The walker correctly finds these nodes, but `categorize_relations` maps `inverse_isa` to the `"subtype"` category.
+
+-   The node appears in the graph because `build_dag_network` renders nodes from multiple categories, including `subtypes`.
+-   The "Procedures" data table remains empty because it is populated *only* from `dag_result$procedures`, and the node was never assigned to that category.
+
+**Recommended Fix:**
+This requires an architectural change. The categorization should be based on the intrinsic properties of the node itself (its semantic type from MRSTY), not just the path taken to find it.
+
+1.  **Modify the Walker:** After the `bfs_walk` completes, iterate through the collected `all_rels` tibble.
+2.  **Fetch Semantic Types:** For each unique `related_cui` in the results, perform a batch lookup against the `mrsty` table to get its semantic types (e.g., 'Therapeutic or Preventive Procedure').
+3.  **Re-categorize:** Create a new `final_category` column. Use a mapping from semantic types to your application's categories (`procedure`, `lab`, `anatomy`, etc.). This new mapping should take precedence over the initial `rela`-based category for clinical concepts.
+4.  **Populate Final Lists:** Use `final_category` to populate the `dag_result` lists (`$procedures`, `$treatments`, etc.).
+
+This ensures that a procedure is always treated as a procedure, regardless of how it was discovered.
+
+### 3. Sparse Lab/Procedure Recall
+**Severity:** Medium (Completeness)
+**Files:** `app/R/dag_walker.R`
+
+**Root Cause:**
+The current densifier, `walk_concept_dag_dense`, intelligently expands the graph by walking up to parents and down to subtypes. However, as you noted, it does not perform a targeted search for specific kinds of missing information. If a concept's immediate neighborhood (including parents/subtypes) doesn't happen to contain labs or procedures via the standard `rela`s, the app will report zero, even if they exist in UMLS.
+
+**Recommended Fix:**
+Augment `walk_concept_dag_dense` with the MRSTY-typed fallback you suggested.
+
+1.  After the initial dense walk is complete, check if `nrow(base$procedures) == 0`.
+2.  If it is, execute a new, targeted query. This query should join `mrrel` and `mrsty` to find direct neighbors of the root CUI that have a semantic type (STY) of 'Therapeutic or Preventive Procedure', 'Diagnostic Procedure', etc.
+3.  A similar check and fallback query should be implemented for labs ('Laboratory Procedure').
+4.  These new results should be merged into the `base` dag result. This can be done by creating a small, compatible tibble and using `dplyr::bind_rows`.
+
+```r
+# In app/R/dag_walker.R, at the end of walk_concept_dag_dense()
+
+# ... after existing densification steps ...
+
+# Tier 4: MRSTY-based fallback for sparse categories
+if (nrow(base$procedures) == 0) {
+  if (!is.null(progress)) progress("Fallback: Searching for procedures by semantic type...")
+  # This function would need to be created in umls_client_duckdb.R
+  fallback_procs <- umls_get_neighbors_by_sty(
+    cui,
+    stys = c('Therapeutic or Preventive Procedure', 'Diagnostic Procedure')
+  )
+  if (nrow(fallback_procs) > 0) {
+    fallback_procs$category <- "procedure"
+    base$procedures <- dplyr::bind_rows(base$procedures, fallback_procs)
+    base$relations <- dplyr::bind_rows(base$relations, fallback_procs)
+  }
+}
+# (repeat for labs)
+
+return(base)
+```
+
+## Architectural Concerns (P0)
+
+### 1. Human-Readable Edge Labels
+**Files:** `app/R/network_viz.R`, `app/R/dag_export.R`
+
+**Concern:** As you pointed out, edge labels like `isa` and `inverse_isa` are jargon. This should be handled consistently.
+
+**Recommendation:** Create a centralized lookup table for `rela` to display labels.
+
+```r
+# Define this in a central location, e.g., dag_walker.R or network_viz.R
+RELA_DISPLAY_LABELS <- c(
+  "may_be_treated_by" = "may be treated by",
+  "may_treat" = "may treat",
+  "isa" = "is a kind of",
+  "inverse_isa" = "has subtype",
+  "clinically_associated_with" = "associated with",
+  "co-occurs_with" = "co-occurs with",
+  "has_finding_site" = "has finding site",
+  "evaluated_by" = "evaluated by",
+  "has_causative_agent" = "caused by"
+  # ... add more as needed
+)
+
+# In app/R/network_viz.R, build_dag_network()
+# ...
+    edges <- tibble::tibble(
+      from   = edge_from,
+      to     = data$related_cui,
+      # Apply the lookup here
+      label  = unname(RELA_DISPLAY_LABELS[data$rela]) %||% data$rela,
+      arrows = "to",
+      color  = DOMAIN_COLORS[category] %||% "#7F8C8D"
+    )
+# ...
+
+# A similar change should be made in dag_export.R's .dag_to_nodes_edges()
+# to ensure exported files also get the friendly labels.
+```
+
+### 2. Graph Clutter and Star Patterns
+**Files:** `app/R/network_viz.R`
+
+**Concern:** The graph can become cluttered with clinically uninformative nodes, and the disconnected star patterns make it hard to see distinct clinical themes.
+
+**Recommendation:** Implement both of your suggestions: semantic filtering and clustering.
+
+1.  **Semantic Filtering:** Before rendering, filter the nodes to be displayed. Define a vector of "clinical" semantic group names (e.g., `T047` for Disease or Syndrome, `T121` for Pharmacologic Substance). The walker would need to be modified to fetch and store the semantic types for *all* nodes, not just the root. Then, `build_dag_network` can filter on these types before rendering.
+2.  **Clustering:** Use `igraph` to identify connected components and `visNetwork` to cluster them. This is a powerful way to visually group related concepts.
+
+```r
+# In app/R/network_viz.R, at the end of build_dag_network(), before visNetwork() call
+
+# This requires the 'igraph' package
+if (nrow(edges) > 0 && requireNamespace("igraph", quietly = TRUE)) {
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = nodes)
+  components <- igraph::components(g)
+  nodes$cluster <- components$membership[nodes$id]
+
+  # Now, when calling visNetwork, you can use this for clustering
+  visNetwork::visNetwork(...) |>
+    # ... other options ...
+    visNetwork::visClusteringByGroup(groups = unique(nodes$cluster))
+}
+```
+
+### 3. Grouping Column for CSV Exports
+**Files:** `app/R/dag_export.R`
+
+**Concern:** The CSV exports lack a grouping column, making it difficult for downstream analysis to distinguish between the different "star patterns" or components.
+
+**Recommendation:** Implement the same connected components logic from the previous point within `dag_export.R`.
+
+```r
+# In app/R/dag_export.R, at the end of .dag_to_nodes_edges()
+
+# ... after nodes and edges tibbles are created ...
+if (nrow(edges) > 0 && requireNamespace("igraph", quietly = TRUE)) {
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = nodes)
+  components <- igraph::components(g)
+  nodes$cluster_id <- components$membership[nodes$id]
+
+  # Add cluster_id to edges as well, based on the 'from' node
+  edge_cluster_map <- setNames(nodes$cluster_id, nodes$id)
+  edges$cluster_id <- edge_cluster_map[edges$from]
+} else {
+  nodes$cluster_id <- if (nrow(nodes) > 0) 1L else integer(0)
+  edges$cluster_id <- integer(0)
+}
+
+list(nodes = nodes, edges = edges)
+```
+
+## Style/Lint (P2)
+
+### 1. Telemetry Coverage
+**Files:** `app/app.R`
+**Issue:** The `retraverse_*` buttons in the UI are not wrapped in `track()` calls. User actions that trigger API calls and modify the main reactive value should be logged for usage analysis.
+**Fix:** Add a `track()` call inside each `.retraverse_handler` function.
+
+### 2. Hardcoded Values
+**Files:** `app/app.R`
+**Issue:** The `retraverse_category` function is called with a hardcoded `max_calls = 8L`. This might be too low for a comprehensive re-traversal.
+**Fix:** Consider making this a parameter in the UI, or increasing the default for these user-initiated deep dives.
+
+### 3. REST API Rate Limiting
+**Files:** `app/R/code_lists.R`, `app/R/umls_client_duckdb.R`
+**Issue:** The code uses `Sys.sleep()` for rate limiting. A more robust approach is to use the features of the `httr2` package.
+**Fix:** In the REST fallback functions (`*_rest`) and in `.loinc_class_number`, add `httr2::req_retry()` to the request pipe. This can handle transient errors and 429 (Too Many Requests) status codes automatically with exponential backoff.
+
+## What I'd do first
+
+Here is a punch list of the first 5 actions I would take, ordered by impact-to-effort ratio:
+
+1.  **Fix Unresolved CUI Labels (P1, Issue 1):** Implement the fallback name lookup in `umls_client_duckdb.R`. This is a high-impact visual fix that makes the entire application more professional and usable.
+2.  **Implement Human-Readable Edge Labels (P0, Issue 2):** Create and apply the `RELA_DISPLAY_LABELS` lookup table. This is another low-effort, high-impact UI improvement that removes jargon.
+3.  **Add Grouping Column to CSV Export (P0, Issue 5):** Modify `dag_export.R` to add the `cluster_id`. This is a critical feature for anyone using the export functionality for analysis and is straightforward to implement with `igraph`.
+4.  **Diagnose and Propose Fix for Procedure Desync (P1, Issue 3):** While the full fix is architectural, the first step is to confirm the diagnosis and write down the plan for the MRSTY-based re-categorization. This clarifies a major data integrity problem.
+5.  **Add Clustering to the Network Viz (P0, Issue 4):** Implement `visClusteringByGroup`. This directly addresses the "star pattern" clutter and dramatically improves the exploratory power of the visualization.
+
+################################################################################
+# FILE 21: reviews/round-2/gpt-5.md
+################################################################################
+
+
+
+## Critical Issues (P1)
+
+1) Unresolved CUI labels leak into node labels and exports
+- Severity: High (user-facing labels show bare CUIs; undermines usability)
+- Files/lines:
+  - app/R/umls_client_duckdb.R: function umls_get_relations() — medrt_compat builds related_name from RxNav without joining concept_preferred; bidir fallback to CUI when preferred name missing: coalesce(cp.preferred_name, r.cui2).
+  - app/R/dag_export.R: .dag_to_nodes_edges() sets label = tbl$related_name without a guaranteed preferred-name backfill.
+  - app/R/network_viz.R: build_dag_network() uses label = clean_node_label(data$related_name), no fallback to preferred_name.
+- Root cause:
+  - MED-RT rows keep RxNav drug names; no concept_preferred join.
+  - When concept_preferred lacks a row (rare but present), related_name falls back to CUI (r.cui2), which then propagates to the graph and CSV.
+- Recommended fix:
+  - Ensure every (related_cui) has a preferred name. For DuckDB, left join concept_preferred for both MRREL and MED-RT derived rows and overwrite related_name when available.
+  - As an additional guard, add a last-mile relabel step in exports/visualization to coalesce label to concept_preferred.preferred_name where related_name is blank or looks like a CUI.
+- Suggested patch (<30 lines) — join preferred names for MED-RT rows:
+  ```
+  # app/R/umls_client_duckdb.R — inside umls_get_relations(), just after medrt_compat creation
+  if (!is.null(medrt) && nrow(medrt) > 0) {
+    medrt_compat <- tibble::tibble(
+      cui            = medrt$cui,
+      related_cui    = medrt$related_cui,
+      related_name   = medrt$related_name,
+      rel            = "RO",
+      rela           = medrt$rela,
+      related_id_url = ""
+    )
+    # Prefer UMLS preferred name when available
+    pref <- DBI::dbGetQuery(con,
+      "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (?)",
+      params = list(unique(medrt_compat$related_cui)))
+    if (nrow(pref) > 0) {
+      medrt_compat <- medrt_compat |>
+        dplyr::left_join(tibble::as_tibble(pref), by = c("related_cui" = "cui")) |>
+        dplyr::mutate(related_name = dplyr::coalesce(preferred_name, related_name)) |>
+        dplyr::select(-preferred_name)
+    }
+    rels <- dplyr::bind_rows(bidir, medrt_compat)
+  } else {
+    rels <- bidir
+  }
+  ```
+  - Optional guard in network_viz build: coalesce labels with concept_preferred when they look like “C\d+”.
+
+2) Edge labels use UMLS jargon (isa/inverse_isa) instead of human-readable phrases
+- Severity: Medium-High (poor UX; confusing)
+- Files/lines:
+  - app/R/network_viz.R: build_dag_network() → edges$label <- data$rela
+  - app/R/dag_export.R: export_graphml() writes <data key="rela"> raw; CSV edges.csv has rela raw only.
+- Root cause:
+  - No display-label mapping is applied for visualization/exports.
+- Recommended fix:
+  - Create a single rela→display label mapping and apply consistently in network_viz and dag_export (add a display_rela column in exports).
+- Suggested patch (<30 lines) — add display mapping in network_viz and use it:
+  ```
+  # app/R/network_viz.R — near top
+  RELA_DISPLAY <- c(
+    "isa" = "is a kind of",
+    "inverse_isa" = "has subtype",
+    "may_be_treated_by" = "may be treated by",
+    "may_treat" = "may treat",
+    "may_be_prevented_by" = "may be prevented by",
+    "clinically_associated_with" = "is associated with",
+    "co-occurs_with" = "co-occurs with",
+    "has_finding_site" = "has finding site",
+    "finding_site_of" = "finding site of",
+    "evaluated_by" = "evaluated by",
+    "has_associated_finding" = "has associated finding",
+    "has_causative_agent" = "caused by",
+    "focus_of" = "has procedure"
+  )
+  .rela_display <- function(x) {
+    y <- RELA_DISPLAY[x]; ifelse(is.na(y) | !nzchar(y), "related to", unname(y))
+  }
+
+  # inside make_category_rows(): set edge label via display mapping
+  edges <- tibble::tibble(
+    from   = edge_from,
+    to     = data$related_cui,
+    label  = .rela_display(data$rela),
+    arrows = "to",
+    color  = DOMAIN_COLORS[category] %||% "#7F8C8D"
+  )
+  ```
+  - Mirror this by adding a display_rela column in dag_export (not shown here due to 30-line cap; see P2 for details).
+
+3) Procedures tab empty while procedure-flavored nodes appear in the graph (repro: “Atrial Tumor” C0741300)
+- Severity: High (tab-graph inconsistency; user-reported repro)
+- Files/lines:
+  - app/R/dag_walker.R: RELA_CATEGORIES maps only "focus_of" to "procedure"; hierarchy- or other-rela-introduced procedures are categorized as parent/subtype/other.
+  - app/R/network_viz.R: graph shows those nodes (as parent/subtype), so users see procedures, but dag_result$procedures remains empty.
+- Root cause:
+  - Classification purely by RELA misses concepts whose semantic type is a Procedure but surface via hierarchy (isa/inverse_isa) or generic associations.
+- Recommended fix:
+  - Post-process relations by MRSTY: if related_cui has a procedure STY (e.g., 'Therapeutic or Preventive Procedure', 'Diagnostic Procedure', 'Laboratory Procedure'), override category to 'procedure' (or 'diagnostic_lab' for Lab procedures) unless already a lab/anatomy leaf.
+  - Apply this enrichment before splitting into dag_result$procedures et al.
+- Suggested patch (<30 lines) — semantic-type recategorization hook:
+  ```
+  # app/R/dag_walker.R — add helper and apply in walk_concept_dag()
+  recategorize_by_semtype <- function(relations) {
+    con <- umls_db_connect(); if (is.null(con) || nrow(relations) == 0) return(relations)
+    stys <- DBI::dbGetQuery(con,
+      "SELECT cui, sty FROM mrsty WHERE cui IN (?)", params = list(unique(relations$related_cui)))
+    if (nrow(stys) == 0) return(relations)
+    proc_sty <- c("Therapeutic or Preventive Procedure","Diagnostic Procedure")
+    lab_sty  <- c("Laboratory Procedure")
+    sty_lu <- tapply(stys$sty, stys$cui, function(v) unique(v))
+    relations$category <- vapply(seq_len(nrow(relations)), function(i) {
+      rc <- relations$related_cui[i]; cat0 <- relations$category[i]
+      s <- sty_lu[[rc]] %||% character(0)
+      if (any(s %in% proc_sty)) "procedure"
+      else if (any(s %in% lab_sty) && cat0 != "monitoring_lab") "diagnostic_lab"
+      else cat0
+    }, FUN.VALUE = character(1))
+    relations
+  }
+
+  # in walk_concept_dag(), just after all_rels <- bfs_walk(...):
+  all_rels <- recategorize_by_semtype(all_rels)
+  ```
+  - This will route hierarchy-surfaced procedure CUIs into dag$procedures, fixing the tab/graph desync for the repro and similar cases.
+
+4) Diagnostic labs mis-grouped and legend mismatch
+- Severity: Medium (confusing coloring/legend; lab counts ok)
+- Files/lines:
+  - app/R/network_viz.R: cats list calls make_category_rows(dag_result$diagnostic_labs, "monitoring_lab", max_nodes = 15) — diagnostic labs rendered under monitoring_lab group.
+  - DOMAIN_COLORS lacks a "diagnostic_lab" entry.
+- Root cause:
+  - Typo in category routing for visualization; missing color key.
+- Recommended fix:
+  - Render diagnostic_labs with group "diagnostic_lab" and add a matching color (can reuse monitoring green).
+- Suggested patch (<30 lines):
+  ```
+  # app/R/network_viz.R — extend colors
+  DOMAIN_COLORS <- c(
+    "population"="#E74C3C","treatment"="#3498DB","monitoring_lab"="#2ECC71",
+    "diagnostic_lab"="#2ECC71","comorbidity"="#E67E22","procedure"="#9B59B6",
+    "anatomy"="#F39C12","subtype"="#95A5A6","parent"="#BDC3C7","outcome"="#E74C3C",
+    "intervention"="#1ABC9C","comparator"="#16A085","etiology"="#C0392B","other"="#7F8C8D"
+  )
+
+  # cats list: fix group for diagnostic labs
+  cats <- list(
+    make_category_rows(dag_result$treatments,"treatment",15),
+    make_category_rows(dag_result$comorbidities,"comorbidity",15),
+    make_category_rows(dag_result$procedures,"procedure",15),
+    make_category_rows(dag_result$anatomy,"anatomy",10),
+    make_category_rows(dag_result$subtypes,"subtype",15),
+    make_category_rows(dag_result$parents,"parent",6),
+    make_category_rows(dag_result$diagnostic_labs,"diagnostic_lab",15),
+    if (!is.null(dag_result$etiology)) make_category_rows(dag_result$etiology,"etiology",8) else list(nodes=NULL,edges=NULL)
+  )
+  ```
+  - Also add a visGroups line for "diagnostic_lab" mirroring monitoring_lab.
+
+5) CSV/GraphML exports lack cluster IDs and GraphML uses duplicate key ids
+- Severity: Medium (downstream stratification impossible; GraphML validity risk)
+- Files/lines:
+  - app/R/dag_export.R: .dag_to_nodes_edges() does not compute connected components; export_graphml() defines key id="category" for both node and edge.
+- Root cause:
+  - No component computation; GraphML keys not unique across node/edge namespaces.
+- Recommended fix:
+  - Compute connected components on the rendered edge set and add cluster_id to nodes and edges. Change GraphML keys to unique ids for node vs edge categories.
+- Suggested patch (<30 lines) — unique GraphML keys:
+  ```
+  # app/R/dag_export.R — in export_graphml()
+  paste(c(
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<graphml xmlns="http://graphml.graphdrawing.org/xmlns">',
+    '  <key id="node_label"    for="node" attr.name="label"    attr.type="string"/>',
+    '  <key id="node_category" for="node" attr.name="category" attr.type="string"/>',
+    '  <key id="edge_rela"     for="edge" attr.name="rela"     attr.type="string"/>',
+    '  <key id="edge_category" for="edge" attr.name="category" attr.type="string"/>',
+    ...
+    sprintf('  <graph id="%s" edgedefault="directed">', esc(dag$concept$cui %||% "DAG")),
+    node_lines, edge_lines, '  </graph>','</graphml>'
+  ), collapse = "\n")
+  ```
+  - Compute cluster_id and add to nodes/edges in .dag_to_nodes_edges() using igraph::components() (full patch would exceed the 30-line cap; see “Architectural Concerns” for the algorithm and schema change).
+
+6) QMD export references nonexistent column parent_drug_name for monitoring labs
+- Severity: Medium (document generation shows blank in “Monitors” column)
+- Files/lines:
+  - app/app.R: in output$download_pull_request content builder — uses unique_labs$parent_drug_name[i], but monitoring_labs are never given parent_drug_name; earlier the table uses joined drug_name.
+- Root cause:
+  - Inconsistent column name between monitoring_labs DT render and QMD generation.
+- Recommended fix:
+  - Replace parent_drug_name with drug_name (or re-join).
+- Suggested patch (<30 lines):
+  ```
+  # app/app.R — inside download_pull_request content builder
+  if (nrow(monitoring) > 0) {
+    lines <- c(lines, "", "# Monitoring Labs", "",
+                "| Lab | Monitors | CUI |",
+                "|-----|----------|-----|")
+    unique_labs <- monitoring |> dplyr::distinct(related_cui, .keep_all = TRUE) |> utils::head(30)
+    for (i in seq_len(nrow(unique_labs))) {
+      lines <- c(lines, paste0(
+        "| ", unique_labs$related_name[i],
+        " | ", (unique_labs$drug_name %||% unique_labs$from_cui)[i],
+        " | ", unique_labs$related_cui[i], " |"
+      ))
+    }
+  }
+  ```
+
+## Architectural Concerns (P0)
+
+- Add a consistent semantic-typing layer in the walker
+  - Decision: bake MRSTY-enriched categorization into the traversal pipeline. Today, categories are assigned from RELA alone (RELA_CATEGORIES), which misses clinically important cases (e.g., procedures via isa/inverse_isa). The proposed recategorize_by_semtype helper enables this in DuckDB-backed runs. If REST-only mode should be fully supported, you’ll need a MRSTY fetch API or a small in-memory cache hydrated from REST (higher effort, more HTTP).
+- Centralize relation label display policy
+  - Decision: own a single canonical mapping for rela→display label and use it in both viz and exports. Current code has biolink predicate mapping in dag_export (.biolink_predicate) and raw UMLS labels in vis; this leads to inconsistent surface area. Consider exporting both original_predicate and display_predicate.
+- Graph component clustering and UI gating
+  - Decision: filter and cluster the visible graph by clinical STYs and surface clusters explicitly. Implementation path:
+    - Compute connected components on the current edges (igraph) and attach cluster_id.
+    - Add a UI toggle to show “clinical core only” (STYs in Disease or Syndrome, Neoplastic Process, Finding, Pharmacologic Substance, Clinical Drug, Laboratory Procedure, Diagnostic Procedure, Therapeutic or Preventive Procedure). Default it ON.
+    - Optional: visNetwork::visClusterByGroup is group-based, not components-based. You can still group by cluster_id by setting nodes$group <- paste0("cluster_", cluster_id), but that replaces domain-coloring. Alternatively, keep domain group for color and use shape to indicate clusters, or add a secondary grouping in the legend.
+- Export schema bump (CSV)
+  - Decision: include display_rela, cluster_id in edges.csv and cluster_id in nodes.csv. Backward-compatible if appended as new columns.
+- Error budget and retries
+  - Decision: centralize HTTP retry/backoff (httr2::req_retry) for all UMLS and RxNav calls. Current Sys.sleep sprinkling is pragmatic but brittle and increases wall time. Use req_retry with backoff on 429/5xx.
+
+## Style/Lint (P2)
+
+- network_viz: ensure visGroups has a group for "diagnostic_lab" (after adding it to DOMAIN_COLORS).
+- dag_export GraphML: duplicate key id “category” used for node and edge—fixed in P1. Consider also adding a display_rela key for human-friendly labels.
+- dag_export: .xml_escape currently handles both node and edge data; good. Add tests to ensure quotes/apostrophes in labels round-trip.
+- dag_walker: tryCatch handlers silently drop errors (resolve_source_url_to_cui, bfs_walk). Emit a warning with where and the CUI/URL to ease debugging (you already have telemetry in safely_run elsewhere).
+- Telemetry coverage is good; consider logging when the semantic-typing fallback reassigns a category (counts per assignment) to evaluate how often RELA-only mapping misses procedures/labs.
+- app/app.R: small mismatch in terminology: “Diagnostic Labs (from disease → evaluated_by / has_associated_finding)” but visualization had all labs grouped under monitoring until the patch.
+
+## What I'd do first
+
+- Implement semantic-typing recategorization (P1 #3) in dag_walker and re-run the “Atrial Tumor” repro to fix the Procedures tab desync with minimal code change.
+- Fix diagnostic lab grouping and add display labels for edges (P1 #2 and #4). This gives immediate UX wins in the graph.
+- Patch MED-RT label resolution to concept_preferred (P1 #1) so no node shows a bare CUI string; verify a seed that previously displayed CUIs.
+- Fix GraphML keys and add cluster_id computation in dag_export (P1 #5). Even adding cluster_id only to CSV first is fine; GraphML cluster attribute can follow.
+- Correct the QMD export lab section to use drug_name (P1 #6) and add a quick unit test or snapshot test for the QMD generator so this doesn’t regress.
+
+If you want me to supply follow-on patches (cluster_id in CSV, export display_rela, and an igraph-based component computation) I can draft them next.
+
+################################################################################
+# FILE 22: reviews/round-2/grok-4.md
+################################################################################
+
+
+
+**Critical Issues (P1)**
+
+**Unresolved CUI labels**  
+*Severity:* High (directly matches user-reported bug; every visible node label is affected).  
+*Files/Functions:* `app/R/umls_client_duckdb.R:148` (the `mrrel_bidir` query), `app/R/umls_client_duckdb.R:170-180` (hierarchy join), `app/R/network_viz.R:72` and `app/R/network_viz.R:92` (`make_category_rows` and root node), `app/R/dag_export.R:68` (`.dag_to_nodes_edges`).  
+*Root cause:*  
+```r
+coalesce(cp.preferred_name, r.cui2) AS related_name
+```
+When `concept_preferred` has no row (build filters in `scripts/build_umls_db.R:170-190` are strict: `ts='P' AND tty='PT'` etc.), the CUI string is emitted. `clean_node_label()` only does regex stripping and `str_trunc`; it never resolves a bare CUI. Same fallback appears in MED-RT path and MRHIER name_lookup.  
+*Recommended fix:* Add a `umls_preferred_name()` helper in `umls_client_duckdb.R` that always returns a human-readable string (preferred → any ENG PT → CUI as last resort). Patch (18 lines):
+
+```r
+# app/R/umls_client_duckdb.R (add after umls_db_connect)
+umls_preferred_name <- function(cuis) {
+  con <- umls_db_connect()
+  if (is.null(con)) return(cuis)  # REST fallback path
+  params <- as.list(unique(cuis))
+  ph <- paste(rep("?", length(params)), collapse = ",")
+  res <- DBI::dbGetQuery(con, sprintf(
+    "SELECT cui, preferred_name FROM concept_preferred WHERE cui IN (%s)", ph
+  ), params = params)
+  lookup <- setNames(res$preferred_name, res$cui)
+  dplyr::coalesce(lookup[cuis], cuis)
+}
+
+# Then replace the coalesce lines with:
+# related_name = umls_preferred_name(r.cui2)
+```
+
+**Awkward UMLS jargon for edge labels**  
+*Severity:* High (user-facing visualization and CSV export).  
+*Files/Functions:* `app/R/network_viz.R:102` (`label = data$rela`), `app/R/dag_export.R:88` (GraphML/CSV uses raw `rela`), `app/R/dag_walker.R:30-80` (RELA_CATEGORIES).  
+*Root cause:* No display mapping; raw strings `"isa"`, `"inverse_isa"`, `"may_be_treated_by"` are shown. The existing `RELA_CATEGORIES` vector is only for routing, not human labels.  
+*Recommended fix:* Single lookup table (add to `network_viz.R` or a new `R/rela_display.R`). Apply to both `visNetwork` edges and all export functions. Patch for viz (12 lines):
+
+```r
+# app/R/network_viz.R (after DOMAIN_COLORS)
+RELA_DISPLAY <- c(
+  "isa" = "is a kind of", "inverse_isa" = "has subtype",
+  "may_be_treated_by" = "may be treated by", "may_treat" = "may treat",
+  "has_finding_site" = "found in", "clinically_associated_with" = "clinically associated with",
+  .default = "related to"
+)
+# Then in edges:
+label = RELA_DISPLAY[data$rela] %||% data$rela,
+```
+
+**Procedures-tab/graph desync (exact repro: C0741300 "Atrial Tumor")**  
+*Severity:* High (concrete user report; data inconsistency).  
+*Files/Functions:* `app/R/dag_walker.R:55` (`RELA_CATEGORIES["focus_of"] = "procedure"`), `app/R/dag_walker.R:220` (BFS depth>0 filter drops "other_rela"), `app/R/dag_walker.R:280` (`extract("procedure")`), `app/R/network_viz.R:60-110` (adds *all* category nodes).  
+*Root cause:* Nodes like "Transplant of Heart" arrive via `inverse_isa` (routed to `subtypes`) or hierarchy expansion, never hit the `"procedure"` category. Tables filter strictly on `dag_result$procedures`; graph renders every category. No MRSTY cross-check.  
+*Recommended fix:* After collecting relations, join `mrsty` and reclassify any related concept whose semantic type is in `c("Therapeutic or Preventive Procedure", "Laboratory Procedure", "Diagnostic Procedure")` into the correct tab list (even if rela was hierarchy). Cross-reference rendered nodes vs tab filters as suggested.
+
+**Star-pattern clutter + missing clinical-type filter**  
+*Severity:* High (core UX complaint).  
+*Files/Functions:* `app/R/dag_walker.R:140` (`BFS_EXPAND_CATEGORIES`), `app/R/network_viz.R:115-130` (no semantic-type filter before `visNetwork`), `app/R/dag_export.R:50` (`.dag_to_nodes_edges`).  
+*Root cause:* Walker queues anything in `BFS_EXPAND_CATEGORIES` and emits all categories; no `mrsty` guard. Peripheral non-clinical nodes create disconnected stars.  
+*Recommended fix:* In `build_dag_network`, add MRSTY filter (query `mrsty` once for all node CUIs, keep only clinical types). Then compute clusters with `igraph::components()` on the edge set and call `visNetwork::visClusterByGroup`.
+
+**CSV exports need grouping column**  
+*Severity:* Medium-high (breaks downstream consumers).  
+*Files/Functions:* `app/R/dag_export.R:40-90` (`.dag_to_nodes_edges` and `export_csv_zip`).  
+*Root cause:* Nodes/edges tibbles only have `id/label/category` and `from/to/rela/category`. No `cluster_id` computed from connected components of the *rendered* edge set.  
+*Recommended fix:* After building `ne <- .dag_to_nodes_edges(dag)`, run `igraph::graph_from_data_frame(ne$edges)` → `igraph::components()` → add `cluster_id` column to both tibbles before writing CSVs.
+
+**Sparse lab/procedure recall**  
+*Severity:* High (directly matches user report).  
+*Files/Functions:* `app/R/dag_walker.R:310-380` (`walk_concept_dag_dense` densifier), `app/R/dag_walker.R:200` (depth>0 filter that drops "other_rela").  
+*Root cause:* Densifier only walks first few parents/subtypes + lexical fallback. If a lab/procedure is only reachable via a non-mapped rela or deeper hierarchy, it is filtered out at depth > 0. No MRSTY-typed fallback query exists.  
+*Recommended fix:* When `nrow(dag$procedures) == 0` or labs empty, run a targeted `umls_get_relations` filtered by semantic types from `mrsty` (`'Therapeutic or Preventive Procedure'`, `'Laboratory Procedure'`, etc.) and merge.
+
+**Architectural Concerns (P0)**
+
+1. **Rela-based vs semantic-type-based classification.** The entire routing (`RELA_CATEGORIES` → `categorize_relations` → `extract()`) lives in `dag_walker.R`. The concrete repro for procedures proves this is insufficient. Decision needed: do we keep rela-driven categories for the DAG structure but *post-process* every rendered node with its MRSTY type for the per-tab tables, or do we make MRSTY the primary classifier and treat rela only as edge label?
+
+2. **Graph rendering vs tab data model divergence.** `build_dag_network` consumes the full `dag_result` list and renders *everything*; the DT tables each consume a single sliced tibble. This guarantees desync. A single source-of-truth tibble (with `category` *and* `semantic_type` columns) passed to both would be cleaner.
+
+3. **DuckDB vs REST fallback surface area.** `umls_client_duckdb.R` is ~400 lines of duplicated fallback functions. Any new column (e.g., MRSTY for the filters above) must be added in two places. The MED-RT cache lives only in DuckDB path. Consider making the DuckDB path the only supported backend for production.
+
+**Style/Lint (P2)**
+
+- `app/R/dag_walker.R:250` and many `tryCatch(..., error = \(e) NULL)` silently swallow errors (same pattern in `resolve_source_url_to_cui`, `medrt_get_relations`, code_lists generators). Telemetry already has `safely_run`; these should log via it.
+- `app/R/network_viz.R:40` — `clean_node_label` uses `stringr::str_trunc` but the rest is base R `gsub`/`sub`; inconsistent.
+- `app/R/dag_export.R:140` — `.nodes_edges_to_dag` reconstructs a full `dag_result` shape but many fields (`genetic`, `interpretation`, `contraindications`) are never populated from imports.
+- Missing column attestation in all exported CSVs (no `source`, `timestamp`, `build_version`).
+- `app/app.R:380` — `safe()` wrapper is used for most renderers but not for the Mermaid/GraphML preview or pull-request QMD generation.
+
+**What I'd do first**
+
+- **Fix preferred-name resolution everywhere** (`umls_preferred_name` helper + update the three call sites) — highest user-visible impact, <30 lines, eliminates all bare-CUI bugs.
+- **Add RELA_DISPLAY lookup table and apply to edge labels + CSV/GraphML exports** — one table, used in viz and export, directly addresses jargon complaint.
+- **Add MRSTY post-classification step in `walk_concept_dag`** (join `mrsty` once, re-bucket procedures/labs regardless of original rela) — fixes the exact "Atrial Tumor" desync and sparse recall in one place.
+- **Insert semantic-type filter + cluster computation in `build_dag_network`** before `visNetwork` call — removes star clutter and gives us the edge set needed for CSV `cluster_id`.
+- **Add `cluster_id` column to `.dag_to_nodes_edges`** (using the same igraph components logic) and update `export_csv_zip` — low effort, high downstream value.
+
+These five changes close every prioritized user-reported issue with minimal new architecture. The remaining P0 decisions (rela vs semantic primacy, DuckDB-only path) can be taken after the immediate bugs are gone.
+
+################################################################################
+# FILE 23: scripts/add_mrhier_mrdef.R
 ################################################################################
 
 #!/usr/bin/env Rscript
@@ -4399,7 +5906,7 @@ cat_progress("Done.")
 
 
 ################################################################################
-# FILE 20: scripts/build_umls_db.R
+# FILE 24: scripts/build_umls_db.R
 ################################################################################
 
 #!/usr/bin/env Rscript
@@ -4707,7 +6214,7 @@ cat_progress(paste("Build complete:", DB_PATH))
 
 
 ################################################################################
-# FILE 21: scripts/download_umls.sh
+# FILE 25: scripts/download_umls.sh
 ################################################################################
 
 #!/usr/bin/env bash
@@ -4847,7 +6354,7 @@ echo "Next step: Rscript /srv/umls/build_umls_db.R"
 
 
 ################################################################################
-# FILE 22: scripts/read_events.R
+# FILE 26: scripts/read_events.R
 ################################################################################
 
 #!/usr/bin/env Rscript
