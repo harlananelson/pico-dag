@@ -75,12 +75,53 @@ generate_snomed_codes <- function(cui) {
   dplyr::distinct(out, code, vocabulary, .keep_all = TRUE)
 }
 
+#' Resolve a DAG relation table to source codes in a target vocabulary.
+#'
+#' Crosswalk-first, harvest-fallback:
+#'  - When `related_cui` is a real CUI (the DuckDB backend, or any CUI-valued
+#'    relation), look the concept up in the requested vocabulary via
+#'    umls_get_source_codes() — this yields clean billing codes (e.g. ICD-10).
+#'  - When the id is a source code / AUI (the bare REST relations endpoint),
+#'    harvest the code straight from `related_id_url`.
+#' This way the same generators give precise ICD-10/RxNorm/LOINC when the local
+#' UMLS DuckDB is present, and still produce useful (multi-vocab) output over
+#' REST when it is not.
+#'
+#' @param tbl   a DAG relation tibble
+#' @param vocab target source abbreviation (e.g. "ICD10CM", "RXNORM", "LNC")
+#' @return tibble(code, name, vocabulary, source_cui)
+.resolve_codes <- function(tbl, vocab) {
+  if (is.null(tbl) || !is.data.frame(tbl) || nrow(tbl) == 0) return(tibble::tibble())
+
+  # (1) Native codes harvested from related_id_url — multi-vocabulary, never
+  #     empty when the URL is source-coded; keeps breadth (MSH/SNOMED/LNC/...).
+  parts <- list(.codes_from_relations(tbl, vocab = NULL))
+
+  # (2) Target-vocabulary codes via crosswalk for CUI-valued relations (DuckDB
+  #     mrconso, or REST atoms) — adds clean billing codes (e.g. ICD-10) that
+  #     the native atom may not be expressed in.
+  rcui <- tbl$related_cui %||% rep(NA_character_, nrow(tbl))
+  cui_rows <- tbl[grepl("^C[0-9]+$", rcui), , drop = FALSE]
+  if (nrow(cui_rows) > 0) {
+    parts[[2]] <- purrr::map(seq_len(nrow(cui_rows)), function(i) {
+      codes <- tryCatch(umls_get_source_codes(cui_rows$related_cui[i], vocab),
+                        error = function(e) tibble::tibble())
+      if (nrow(codes) > 0) codes$name <- cui_rows$related_name[i]
+      codes
+    }) |> purrr::list_rbind()
+  }
+
+  res <- purrr::list_rbind(parts)
+  if (nrow(res) == 0) return(tibble::tibble())
+  dplyr::distinct(res, code, vocabulary, .keep_all = TRUE)
+}
+
 #' Generate drug codes for treatment concepts (multi-vocabulary).
 #'
 #' @param treatments Tibble of treatment concepts (from DAG walker)
 #' @return Tibble with code, name, vocabulary, source_cui, drug_name
 generate_rxnorm_codes <- function(treatments) {
-  codes <- .codes_from_relations(treatments)
+  codes <- .resolve_codes(treatments, "RXNORM")
   if (nrow(codes) == 0) return(tibble::tibble())
   codes$drug_name <- codes$name
   codes
@@ -113,7 +154,7 @@ generate_rxnorm_codes <- function(treatments) {
 #' @param lab_only Logical. If TRUE (default), filter to LCN=1 only.
 #' @return Tibble with code, name, vocabulary, source_cui, loinc_class
 generate_loinc_codes <- function(labs, lab_only = TRUE) {
-  rows <- .codes_from_relations(labs, vocab = "LNC")
+  rows <- .resolve_codes(labs, "LNC")
   if (nrow(rows) == 0) return(tibble::tibble())
   # Classify each LOINC by LCN (1=Lab); keep NA on lookup failure.
   rows$loinc_class <- purrr::map_int(rows$code, \(lc) {
@@ -129,7 +170,7 @@ generate_loinc_codes <- function(labs, lab_only = TRUE) {
 #' @param procedures Tibble of procedure concepts (from DAG walker)
 #' @return Tibble with code, name, vocabulary, source_cui
 generate_cpt_codes <- function(procedures) {
-  .codes_from_relations(procedures)
+  .resolve_codes(procedures, "CPT")
 }
 
 #' Package all code lists into a named list for export
@@ -150,7 +191,7 @@ package_code_lists <- function(dag_result, pico_elements = list()) {
 
   # Comorbidity codes (multi-vocabulary, harvested from relation URLs)
   if (nrow(dag_result$comorbidities) > 0) {
-    comorbidity_codes <- .codes_from_relations(dag_result$comorbidities)
+    comorbidity_codes <- .resolve_codes(dag_result$comorbidities, "ICD10CM")
     if (nrow(comorbidity_codes) > 0) {
       comorbidity_codes$condition_name <- comorbidity_codes$name
       code_lists$comorbidity_icd10 <- comorbidity_codes
