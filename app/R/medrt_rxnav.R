@@ -211,6 +211,11 @@ medrt_get_relations <- function(cui, refresh = FALSE, cache_only = FALSE) {
   if (isTRUE(cache_only)) return(tibble::tibble())
   fresh <- tryCatch(fetch_medrt_relations(cui),
                     error = function(e) tibble::tibble())
-  medrt_cache_store(cui, fresh)
+  # Only persist when the UMLS DuckDB is available. Without it,
+  # fetch_medrt_relations cannot map CUI->MeSH and returns empty NOT because the
+  # disease has no drugs but because we couldn't look. Caching a "nothing here"
+  # sentinel in that case poisons later DuckDB-backed runs (they short-circuit
+  # on the stale sentinel and never fetch the drugs).
+  if (!is.null(umls_db_connect())) medrt_cache_store(cui, fresh)
   fresh
 }

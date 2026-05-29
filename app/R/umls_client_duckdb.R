@@ -351,13 +351,22 @@ umls_get_relations <- function(cui, fetch_medrt = TRUE) {
   } else NULL
 
   if (!is.null(medrt) && nrow(medrt) > 0) {
+    # MED-RT rows already carry the authoritative RxNorm code (rxcui) from
+    # RxNav. Stamp it into related_id_url as a RXNORM source URL so the code-list
+    # harvester reads the RxNorm code DIRECTLY, instead of lossily re-crosswalking
+    # the drug's UMLS CUI back to RXNORM (which collapsed ~all drugs to a few).
+    rxc <- if ("rxcui" %in% names(medrt)) medrt$rxcui else rep("", nrow(medrt))
     medrt_compat <- tibble::tibble(
       cui            = medrt$cui,
       related_cui    = medrt$related_cui,
       related_name   = medrt$related_name,
       rel            = "RO",
       rela           = medrt$rela,
-      related_id_url = ""
+      related_id_url = ifelse(
+        nzchar(rxc %||% ""),
+        paste0("https://uts-ws.nlm.nih.gov/rest/content/current/source/RXNORM/", rxc),
+        ""
+      )
     )
     rels <- dplyr::bind_rows(bidir, medrt_compat)
   } else {
