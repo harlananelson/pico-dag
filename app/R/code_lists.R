@@ -46,24 +46,44 @@ generate_snomed_codes <- function(cui) {
   umls_get_source_codes(cui, "SNOMEDCT_US")
 }
 
-#' Generate RxNorm codes for drug concepts
+#' Harvest source codes directly from a DAG relation table.
+#'
+#' The DAG walker stores each related concept's source atom in
+#' `related_id_url` as `.../source/{SAB}/{code}`. Its `related_cui` column is
+#' therefore usually a SOURCE CODE or AUI, NOT a CUI — so the previous approach
+#' of calling the `CUI/{id}/atoms` crosswalk endpoint returned HTTP 404 and
+#' silently yielded nothing for comorbidities/treatments/labs. We instead read
+#' the (vocabulary, code) pair straight from `related_id_url`: no extra API
+#' calls, no 404s, and multi-vocabulary by design (filter via the `vocab` arg).
+#'
+#' @param tbl   a DAG relation tibble (comorbidities / treatments / *_labs)
+#' @param vocab optional character vector of source abbreviations to keep
+#' @return tibble(code, name, vocabulary, source_cui)
+.codes_from_relations <- function(tbl, vocab = NULL) {
+  if (is.null(tbl) || !is.data.frame(tbl) || nrow(tbl) == 0) return(tibble::tibble())
+  if (!"related_id_url" %in% names(tbl)) return(tibble::tibble())
+  m <- stringr::str_match(tbl$related_id_url, "/source/([^/]+)/([^/?]+)")
+  out <- tibble::tibble(
+    code       = m[, 3],
+    name       = if ("related_name" %in% names(tbl)) tbl$related_name else NA_character_,
+    vocabulary = m[, 2],
+    source_cui = if ("from_cui" %in% names(tbl)) tbl$from_cui
+                 else if ("cui" %in% names(tbl)) tbl$cui else NA_character_
+  )
+  out <- out[!is.na(out$code), , drop = FALSE]
+  if (!is.null(vocab)) out <- out[out$vocabulary %in% vocab, , drop = FALSE]
+  dplyr::distinct(out, code, vocabulary, .keep_all = TRUE)
+}
+
+#' Generate drug codes for treatment concepts (multi-vocabulary).
 #'
 #' @param treatments Tibble of treatment concepts (from DAG walker)
 #' @return Tibble with code, name, vocabulary, source_cui, drug_name
 generate_rxnorm_codes <- function(treatments) {
-  if (nrow(treatments) == 0) return(tibble::tibble())
-
-  purrr::map(seq_len(nrow(treatments)), \(i) {
-    tryCatch({
-      codes <- umls_get_source_codes(treatments$related_cui[i], "RXNORM")
-      if (nrow(codes) > 0) {
-        codes |> dplyr::mutate(drug_name = treatments$related_name[i])
-      } else {
-        tibble::tibble()
-      }
-    }, error = \(e) tibble::tibble())
-  }, .progress = "Generating RxNorm codes") |>
-    purrr::list_rbind()
+  codes <- .codes_from_relations(treatments)
+  if (nrow(codes) == 0) return(tibble::tibble())
+  codes$drug_name <- codes$name
+  codes
 }
 
 #' Fetch the LOINC class number (LCN) for a single LOINC code via UMLS.
@@ -93,23 +113,13 @@ generate_rxnorm_codes <- function(treatments) {
 #' @param lab_only Logical. If TRUE (default), filter to LCN=1 only.
 #' @return Tibble with code, name, vocabulary, source_cui, loinc_class
 generate_loinc_codes <- function(labs, lab_only = TRUE) {
-  if (nrow(labs) == 0) return(tibble::tibble())
-
-  rows <- purrr::map(seq_len(nrow(labs)), \(i) {
-    tryCatch({
-      codes <- umls_get_source_codes(labs$related_cui[i], "LNC")
-      if (nrow(codes) == 0) return(tibble::tibble())
-      # Fetch LCN for each LOINC code (with rate limiting)
-      codes$loinc_class <- purrr::map_int(codes$code, \(lc) {
-        Sys.sleep(0.1)
-        .loinc_class_number(lc)
-      })
-      codes
-    }, error = \(e) tibble::tibble())
-  }) |>
-    purrr::list_rbind()
-
+  rows <- .codes_from_relations(labs, vocab = "LNC")
   if (nrow(rows) == 0) return(tibble::tibble())
+  # Classify each LOINC by LCN (1=Lab); keep NA on lookup failure.
+  rows$loinc_class <- purrr::map_int(rows$code, \(lc) {
+    Sys.sleep(0.05)
+    .loinc_class_number(lc)
+  })
   if (lab_only) rows <- rows |> dplyr::filter(loinc_class == 1L | is.na(loinc_class))
   rows
 }
@@ -119,14 +129,7 @@ generate_loinc_codes <- function(labs, lab_only = TRUE) {
 #' @param procedures Tibble of procedure concepts (from DAG walker)
 #' @return Tibble with code, name, vocabulary, source_cui
 generate_cpt_codes <- function(procedures) {
-  if (nrow(procedures) == 0) return(tibble::tibble())
-
-  purrr::map(seq_len(nrow(procedures)), \(i) {
-    tryCatch({
-      umls_get_source_codes(procedures$related_cui[i], "CPT")
-    }, error = \(e) tibble::tibble())
-  }) |>
-    purrr::list_rbind()
+  .codes_from_relations(procedures)
 }
 
 #' Package all code lists into a named list for export
@@ -145,25 +148,11 @@ package_code_lists <- function(dag_result, pico_elements = list()) {
   pop_snomed <- generate_snomed_codes(dag_result$concept$cui)
   if (nrow(pop_snomed) > 0) code_lists$population_snomed <- pop_snomed
 
-  # Comorbidity ICD-10 (batch)
+  # Comorbidity codes (multi-vocabulary, harvested from relation URLs)
   if (nrow(dag_result$comorbidities) > 0) {
-    comorbidity_codes <- purrr::map(
-      seq_len(min(nrow(dag_result$comorbidities), 30)),
-      \(i) {
-        tryCatch({
-          codes <- umls_get_source_codes(
-            dag_result$comorbidities$related_cui[i], "ICD10CM"
-          )
-          if (nrow(codes) > 0) {
-            codes |> dplyr::mutate(
-              condition_name = dag_result$comorbidities$related_name[i]
-            )
-          } else tibble::tibble()
-        }, error = \(e) tibble::tibble())
-      }
-    ) |> purrr::list_rbind()
-
+    comorbidity_codes <- .codes_from_relations(dag_result$comorbidities)
     if (nrow(comorbidity_codes) > 0) {
+      comorbidity_codes$condition_name <- comorbidity_codes$name
       code_lists$comorbidity_icd10 <- comorbidity_codes
     }
   }

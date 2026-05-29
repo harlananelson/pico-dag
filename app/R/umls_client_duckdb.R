@@ -524,22 +524,31 @@ umls_get_relations_rest <- function(cui) {
 }
 
 umls_get_source_codes_rest <- function(cui, vocabulary) {
+  # Guard: the CUI/{id}/atoms endpoint is valid ONLY for a real CUI (C-number).
+  # DAG relation tables carry source codes / AUIs in `related_cui`, which 404
+  # here; reject them up front so callers never abort on a bad id.
+  if (is.null(cui) || length(cui) != 1L || is.na(cui) || !grepl("^C[0-9]+$", cui)) {
+    return(tibble::tibble())
+  }
   all_codes <- list()
   page <- 1L
 
   repeat {
-    resp <- httr2::request(UMLS_BASE_URL) |>
-      httr2::req_url_path_append("content", "current", "CUI", cui, "atoms") |>
-      httr2::req_url_query(
-        apiKey     = get_api_key(),
-        sabs       = vocabulary,
-        pageSize   = 200L,
-        pageNumber = page
-      ) |>
-      httr2::req_perform() |>
-      httr2::resp_body_json()
-
-    results <- resp$result
+    resp <- tryCatch(
+      httr2::request(UMLS_BASE_URL) |>
+        httr2::req_url_path_append("content", "current", "CUI", cui, "atoms") |>
+        httr2::req_url_query(
+          apiKey     = get_api_key(),
+          sabs       = vocabulary,
+          pageSize   = 200L,
+          pageNumber = page
+        ) |>
+        httr2::req_error(is_error = function(resp) FALSE) |>
+        httr2::req_perform(),
+      error = function(e) NULL
+    )
+    if (is.null(resp) || httr2::resp_status(resp) != 200L) break
+    results <- httr2::resp_body_json(resp)$result
     if (!is.list(results) || length(results) == 0) break
 
     for (atom in results) {
