@@ -196,13 +196,19 @@ medrt_cache_store <- function(cui, rels) {
 
 #' Get MED-RT relations for a CUI, using cache if available.
 #'
-#' @param cui      The UMLS CUI to look up.
-#' @param refresh  Force re-fetch from RxNav even if cached.
-medrt_get_relations <- function(cui, refresh = FALSE) {
+#' @param cui         The UMLS CUI to look up.
+#' @param refresh     Force re-fetch from RxNav even if cached.
+#' @param cache_only  If TRUE, return cached rows only and skip the RxNav
+#'                    fetch on cache miss. Used by BFS for non-seed nodes
+#'                    so the walk doesn't fire 30+ RxNav calls in series —
+#'                    the seed's prefetch path keeps cache_only = FALSE
+#'                    and pays the one-time RxNav cost.
+medrt_get_relations <- function(cui, refresh = FALSE, cache_only = FALSE) {
   if (!refresh) {
     cached <- medrt_cache_lookup(cui)
     if (!is.null(cached)) return(cached)
   }
+  if (isTRUE(cache_only)) return(tibble::tibble())
   fresh <- tryCatch(fetch_medrt_relations(cui),
                     error = function(e) tibble::tibble())
   medrt_cache_store(cui, fresh)

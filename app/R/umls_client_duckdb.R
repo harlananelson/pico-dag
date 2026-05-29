@@ -265,9 +265,13 @@ umls_get_concept <- function(cui) {
 
 #' Get all relations for a CUI
 #'
-#' @param cui Character. UMLS CUI
+#' @param cui          Character. UMLS CUI
+#' @param fetch_medrt  If TRUE (default), fetch missing MED-RT drug-disease
+#'                     relations from RxNav on a cache miss. If FALSE, use
+#'                     cached MED-RT rows only — for BFS neighbors where the
+#'                     30s sequential-RxNav cost outweighs the marginal recall.
 #' @return Tibble with cui, related_cui, related_name, rel, rela, related_id_url
-umls_get_relations <- function(cui) {
+umls_get_relations <- function(cui, fetch_medrt = TRUE) {
   con <- umls_db_connect()
   if (is.null(con)) return(umls_get_relations_rest(cui))
 
@@ -337,9 +341,13 @@ umls_get_relations <- function(cui) {
   # Layer 2: MED-RT drug-disease relations from RxNav (cached locally).
   # These supply the may_be_treated_by / may_be_prevented_by / induced_by /
   # has_contraindicated_drug rows that NLM stores as orphan rows in MRREL.
-  # Cached after first fetch, so this is free on subsequent walks.
+  # Cached after first fetch, so this is free on subsequent walks. BFS
+  # callers set fetch_medrt = FALSE for non-seed nodes to bound first-walk
+  # latency to a single seed-CUI prefetch (~5-10s) instead of 30+ HTTP
+  # round-trips serially across all BFS-visited neighbors.
   medrt <- if (exists("medrt_get_relations", mode = "function")) {
-    tryCatch(medrt_get_relations(cui), error = function(e) NULL)
+    tryCatch(medrt_get_relations(cui, cache_only = !isTRUE(fetch_medrt)),
+             error = function(e) NULL)
   } else NULL
 
   if (!is.null(medrt) && nrow(medrt) > 0) {

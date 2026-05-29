@@ -322,12 +322,20 @@ categorize_relations <- function(relations) {
 #' IDs (RxCUI numerics, AUI atom IDs) are collected for display but not
 #' expanded because the UMLS REST API returns 404 for them.
 #'
-#' @param root_cui     Root concept CUI.
-#' @param max_depth    Maximum hops from root (default 2).
-#' @param expand_n     Max nodes to expand per depth level (controls API calls).
-#' @param progress     Optional progress callback function(message).
+#' @param root_cui          Root concept CUI.
+#' @param max_depth         Maximum hops from root (default 2).
+#' @param expand_n          Max nodes to expand per depth level (controls API calls).
+#' @param progress          Optional progress callback function(message).
+#' @param fetch_medrt_root  If TRUE (default), the root node fetches MED-RT
+#'                          drug-disease relations from RxNav on cache miss.
+#'                          BFS neighbors (depth > 0) always run in cache-only
+#'                          mode regardless. Set FALSE on sub-walks invoked
+#'                          by the densifier — the seed already has its
+#'                          drug-disease data, and re-fetching for a parent
+#'                          / subtype just adds latency.
 #' @return Tibble of all collected relations with depth and via columns.
-bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
+bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L,
+                     progress = NULL, fetch_medrt_root = TRUE) {
   visited  <- character()
   # queue entries: list(cui, source_url, depth, via)
   # source_url is carried for lazy CUI resolution when the node is dequeued.
@@ -363,9 +371,21 @@ bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
 
     visited <- c(visited, effective_cui)
 
+    # Only the seed (depth 0) pays the RxNav round-trip on a MED-RT cache
+    # miss; deeper BFS nodes run cache-only so a single walk doesn't fire
+    # 30+ sequential HTTP calls. Sub-walks invoked by the densifier opt out
+    # entirely via fetch_medrt_root = FALSE.
+    medrt_for_this_node <- isTRUE(fetch_medrt_root) && node$depth == 0L
+
     if (!is.null(progress)) {
       msg <- if (is.na(node$via)) {
-        "Fetching root concept relations..."
+        if (medrt_for_this_node) {
+          paste0("Fetching root concept relations ",
+                 "(drug-disease lookup via NLM RxNav — may take 5-10s ",
+                 "on first walk of a new concept)...")
+        } else {
+          "Fetching root concept relations..."
+        }
       } else {
         paste0("[depth ", node$depth, "] ", node$via)
       }
@@ -373,7 +393,7 @@ bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
     }
 
     rels <- tryCatch({
-      umls_get_relations(effective_cui) |>
+      umls_get_relations(effective_cui, fetch_medrt = medrt_for_this_node) |>
         categorize_relations() |>
         dplyr::mutate(
           depth    = node$depth,
@@ -482,22 +502,26 @@ bfs_walk <- function(root_cui, max_depth = 2L, expand_n = 8L, progress = NULL) {
 #' level. Nodes in BFS_EXPAND_CATEGORIES are queued for further traversal;
 #' leaf categories (labs, anatomy, procedures) are collected but not expanded.
 #'
-#' @param cui          Root CUI.
-#' @param max_depth    Hops from root (1 = direct relations only; 2 = default).
-#' @param expand_n     Max nodes expanded per depth level (caps API calls).
-#' @param progress     Optional progress callback.
+#' @param cui              Root CUI.
+#' @param max_depth        Hops from root (1 = direct relations only; 2 = default).
+#' @param expand_n         Max nodes expanded per depth level (caps API calls).
+#' @param progress         Optional progress callback.
+#' @param fetch_medrt_root If TRUE (default), the root node fetches MED-RT
+#'                         from RxNav on cache miss. Set FALSE for densifier
+#'                         sub-walks where the seed has already paid the cost.
 #' @return Named list: concept, relations, treatments, comorbidities,
 #'   procedures, anatomy, subtypes, parents, diagnostic_labs,
 #'   monitoring_labs, etiology, genetic, interpretation, contraindications.
 walk_concept_dag <- function(cui, max_depth = 2L, expand_n = 8L,
-                             progress = NULL) {
+                             progress = NULL, fetch_medrt_root = TRUE) {
   if (!is.null(progress)) progress("Fetching concept details...")
   concept <- umls_get_concept(cui)
 
   all_rels <- bfs_walk(cui,
-                       max_depth = max_depth,
-                       expand_n  = expand_n,
-                       progress  = progress)
+                       max_depth        = max_depth,
+                       expand_n         = expand_n,
+                       progress         = progress,
+                       fetch_medrt_root = fetch_medrt_root)
 
   # MRSTY-based reclassification: route concepts to their clinical category
   # by semantic type, not just by surfacing rela. Fixes the procedure-tab
@@ -695,8 +719,13 @@ walk_concept_dag_dense <- function(cui, max_depth = 2L, expand_n = 8L,
       # parent-of-parent relations — handles chains of leaf concepts where
       # each link in the chain has only one relation (its own parent).
       sub_depth <- if (link_category == "parent") 2L else 1L
+      # Densifier sub-walks expand hierarchy / lexical neighbors; they
+      # don't need their own MED-RT fetch (the seed already has its
+      # drug-disease relations, and refetching for parents adds latency
+      # without clinical value).
       sub_dag <- tryCatch(
-        walk_concept_dag(target_cui, max_depth = sub_depth, expand_n = expand_n),
+        walk_concept_dag(target_cui, max_depth = sub_depth,
+                         expand_n = expand_n, fetch_medrt_root = FALSE),
         error = function(e) NULL
       )
       calls <- calls + 1L
