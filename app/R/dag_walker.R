@@ -9,6 +9,14 @@ RELA_CATEGORIES <- c(
   "may_be_treated_by"      = "treatment",
   "may_treat"              = "treatment",
   "may_be_prevented_by"    = "treatment",    # vaccines, prophylactics
+  "treated_by"             = "treatment",
+  "treats"                 = "treatment",
+  "used_for"               = "treatment",    # drug/agent used for the condition
+  "has_therapeutic_class"  = "treatment",
+  # MED-RT therapeutic-intent relations (disease<->drug)
+  "regimen_has_accepted_use_for_disease" = "treatment",
+  "has_active_ingredient_regimen"        = "treatment",
+  "ci_with"                = "treatment",    # clinically-indicated-with
 
   # Anatomy
   "has_finding_site"       = "anatomy",
@@ -17,8 +25,16 @@ RELA_CATEGORIES <- c(
   # Labs
   "component_of"           = "monitoring_lab",
   "has_component"          = "monitoring_lab",
+  "measured_component_of"  = "monitoring_lab",
+  "has_measured_component" = "monitoring_lab",
   "has_evaluation"         = "diagnostic_lab",
   "evaluated_by"           = "diagnostic_lab",
+  "measures"               = "diagnostic_lab",   # lab/test measures the condition
+  "measurement_of"         = "diagnostic_lab",
+  "has_measurement"        = "diagnostic_lab",
+  "lab_number_of"          = "diagnostic_lab",
+  "has_lab_number"         = "diagnostic_lab",
+  "assesses_effect_of"     = "diagnostic_lab",
   "has_associated_finding" = "diagnostic_lab",
   "finding_of"             = "diagnostic_lab",
   "diagnoses"              = "diagnostic_lab",
