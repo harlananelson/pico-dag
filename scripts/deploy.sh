@@ -29,7 +29,8 @@ ssh "$HOST" "set -euo pipefail
   tracked_dirty=\$(git status --porcelain --untracked-files=no || true)
   #   2. untracked files that collide with a path origin/main tracks
   collisions=\$(git ls-files --others --exclude-standard | while read -r f; do
-      git cat-file -e \"origin/main:\$f\" 2>/dev/null && echo \"\$f\"; done)
+      if git cat-file -e \"origin/main:\$f\" 2>/dev/null; then echo \"\$f\"; fi
+    done || true)
   if [ -n \"\$tracked_dirty\$collisions\" ]; then
     echo 'ABORT: production tree carries local work a pull would overwrite:' >&2
     [ -n \"\$tracked_dirty\" ] && echo \"\$tracked_dirty\" >&2
