@@ -33,6 +33,19 @@ pico-dag/
 └── CLAUDE.md
 ```
 
+## Deployment
+
+Production is the VPS clone `/srv/shiny-server/pico-dag` on `root@5.78.69.136`,
+served at `https://picodag.globalpatientsafety.com`.
+
+**Deploy only with `scripts/deploy.sh`** (git-pull + restart + smoke-test). The
+flow is always: commit locally → `git push origin main` → `scripts/deploy.sh`.
+
+**NEVER edit, `scp`, or `rsync` files onto the prod clone.** Hand-/agent-editing
+the prod tree produced an 18-commit + ~1,200-line divergence on 2026-05-30 (see
+`snapshots/2026-05-30-*.md`). `deploy.sh` refuses to run against a dirty prod
+tree on purpose — if it aborts, snapshot the box and reconcile, don't force it.
+
 ## Conventions
 
 - R with tidyverse (per positron-verse rules)
