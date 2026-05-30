@@ -10,6 +10,11 @@ result
 # Cache
 *.duckdb
 *.duckdb.wal
+app/app_cache/
+
+# Runtime / secrets (prod-local, never tracked)
+.Renviron
+app/logs/.salt
 
 # Exports
 code-lists/

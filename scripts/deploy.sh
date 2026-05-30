@@ -21,12 +21,19 @@ ssh "$HOST" "set -euo pipefail
   cd '${APP_DIR}'
   git fetch -q origin
 
-  # Guard: refuse to deploy onto a dirty tree. Tracked-file edits OR untracked
-  # files that collide with upstream both break a clean ff and risk data loss.
-  dirty=\$(git status --porcelain | grep -v '^?? \\.Renviron\$' || true)
-  if [ -n \"\$dirty\" ]; then
-    echo 'ABORT: production working tree is not clean:' >&2
-    echo \"\$dirty\" >&2
+  # Guard: refuse to deploy if the prod tree carries work a pull would clobber.
+  # Two real hazards (both caused the 2026-05-30 divergence); harmless runtime
+  # untracked files (app_cache/, logs, .salt, .Renviron) are intentionally NOT
+  # blockers because upstream never tracks them.
+  #   1. modified/deleted TRACKED files
+  tracked_dirty=\$(git status --porcelain --untracked-files=no || true)
+  #   2. untracked files that collide with a path origin/main tracks
+  collisions=\$(git ls-files --others --exclude-standard | while read -r f; do
+      git cat-file -e \"origin/main:\$f\" 2>/dev/null && echo \"\$f\"; done)
+  if [ -n \"\$tracked_dirty\$collisions\" ]; then
+    echo 'ABORT: production tree carries local work a pull would overwrite:' >&2
+    [ -n \"\$tracked_dirty\" ] && echo \"\$tracked_dirty\" >&2
+    [ -n \"\$collisions\" ] && echo \"untracked-but-tracked-upstream: \$collisions\" >&2
     echo >&2
     echo 'Someone edited/copied onto prod directly. Preserve it before deploying:' >&2
     echo '  git checkout -b vps-snapshot-\$(date +%F) && git add -A && git commit -m \"VPS tree\"' >&2
